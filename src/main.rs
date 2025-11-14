@@ -1,4 +1,5 @@
 use std::{
+    cmp,
     collections::{HashMap, HashSet},
     env,
     path::PathBuf,
@@ -12,7 +13,7 @@ use lighter_client::{
     lighter_client::{LighterClient, OrderSide},
     models,
     types::{AccountId, ApiKeyIndex, BaseQty, Expiry, MarketId, Price},
-    ws_client::{OrderBookEvent, WsEvent},
+    ws_client::{OrderBookEvent, WsEvent, WsStream},
 };
 use rust_decimal::Decimal;
 use rust_decimal::prelude::{FromPrimitive, One, ToPrimitive};
@@ -408,19 +409,14 @@ impl Strategy {
     }
 
     async fn run(&mut self) -> Result<()> {
-        let mut ws = self
-            .client
-            .ws()
-            .subscribe_order_book(self.config.market_id)
-            .connect()
-            .await?;
-
+        let mut ws = self.connect_order_book_stream().await?;
         let mut account_log_interval = time::interval(self.config.account_snapshot_interval);
         let mut active_sync_interval = time::interval(self.config.active_order_sync_interval);
 
         info!("strategy event loop started");
 
         loop {
+            let mut reconnect = false;
             tokio::select! {
                 maybe_event = ws.next() => {
                     match maybe_event {
@@ -430,20 +426,23 @@ impl Strategy {
                         Some(Ok(WsEvent::Connected)) => {
                             info!("websocket connected to market {}", self.config.market_id);
                         }
+                        Some(Ok(WsEvent::Pong)) => {
+                            debug!("received websocket pong");
+                        }
                         Some(Ok(WsEvent::Closed(frame))) => {
                             warn!(?frame, "websocket stream closed");
-                            break;
+                            reconnect = true;
                         }
                         Some(Ok(other)) => {
                             debug!(?other, "ignored websocket event");
                         }
                         Some(Err(err)) => {
                             error!(?err, "websocket stream error");
-                            return Err(err.into());
+                            reconnect = true;
                         }
                         None => {
                             warn!("websocket stream ended");
-                            break;
+                            reconnect = true;
                         }
                     }
                 }
@@ -454,9 +453,48 @@ impl Strategy {
                     self.sync_active_orders().await?;
                 }
             }
-        }
 
-        Ok(())
+            if reconnect {
+                let delay = StdDuration::from_secs(1);
+                warn!(?delay, "attempting to reconnect websocket after delay");
+                time::sleep(delay).await;
+                ws = self.connect_order_book_stream().await?;
+                self.sync_active_orders().await?;
+                continue;
+            }
+        }
+    }
+
+    async fn connect_order_book_stream(&self) -> Result<WsStream> {
+        let mut attempt: u32 = 0;
+        loop {
+            match self
+                .client
+                .ws()
+                .subscribe_order_book(self.config.market_id)
+                .connect()
+                .await
+            {
+                Ok(stream) => {
+                    if attempt > 0 {
+                        info!(attempt, "websocket reconnected after retries");
+                    }
+                    return Ok(stream);
+                }
+                Err(err) => {
+                    let backoff_secs = 1_u64 << cmp::min(attempt, 5);
+                    let delay = StdDuration::from_secs(backoff_secs);
+                    warn!(
+                        attempt,
+                        ?err,
+                        ?delay,
+                        "failed to connect websocket, retrying"
+                    );
+                    attempt = attempt.saturating_add(1);
+                    time::sleep(delay).await;
+                }
+            }
+        }
     }
 
     async fn load_market_metadata(
