@@ -286,7 +286,7 @@ impl StrategyState {
             .unwrap_or_else(|_| StdDuration::from_secs(0))
             .as_micros();
         // Ensure the client order ID is within the valid range (0 to 2^48 - 1)
-        const MAX_CLIENT_ORDER_ID: i64 = 281474976710655; 
+        const MAX_CLIENT_ORDER_ID: i64 = 281474976710655;
         let mut initial = (seed % MAX_CLIENT_ORDER_ID as u128) as i64;
         if initial == 0 {
             initial = 1;
@@ -311,6 +311,42 @@ impl StrategyState {
             self.next_client_order_id = 1;
         }
         self.next_client_order_id
+    }
+
+    fn prune_stale_pending(&mut self, now: Instant, max_age: StdDuration) {
+        self.pending_orders.retain(|_, pending| {
+            match now.checked_duration_since(pending.submitted_at) {
+                Some(age) => age <= max_age,
+                None => true,
+            }
+        });
+    }
+
+    fn has_recent_pending(
+        &self,
+        target: &OrderTarget,
+        price_tolerance: i64,
+        qty_tolerance: i64,
+        now: Instant,
+        max_age: StdDuration,
+    ) -> bool {
+        self.pending_orders.values().any(|pending| {
+            if pending.side != target.side || pending.level != target.level {
+                return false;
+            }
+
+            let is_fresh = now
+                .checked_duration_since(pending.submitted_at)
+                .map(|age| age <= max_age)
+                .unwrap_or(true);
+
+            if !is_fresh {
+                return false;
+            }
+
+            (pending.price_ticks - target.price_ticks).abs() <= price_tolerance
+                && (pending.qty_ticks - target.qty_ticks).abs() <= qty_tolerance
+        })
     }
 }
 
@@ -453,6 +489,8 @@ impl Strategy {
 
         let tolerance_ticks = self.price_tolerance_ticks(mid_price)?;
         self.state.matched_orders.clear();
+        let pending_grace = self.pending_cooldown();
+        self.state.prune_stale_pending(now, pending_grace);
 
         let mut to_place = Vec::new();
         for target in &targets {
@@ -474,7 +512,17 @@ impl Strategy {
             if let Some(order_index) = matched {
                 self.state.matched_orders.insert(order_index);
             } else {
-                to_place.push(target.clone());
+                let has_pending = self.state.has_recent_pending(
+                    target,
+                    tolerance_ticks,
+                    self.config.qty_tolerance_ticks,
+                    now,
+                    pending_grace,
+                );
+
+                if !has_pending {
+                    to_place.push(target.clone());
+                }
             }
         }
 
@@ -827,6 +875,14 @@ impl Strategy {
         let tolerance_price = (mid_price * fraction).max(self.metadata.price_tick());
         let ticks = decimal_to_scaled_i64(tolerance_price, self.metadata.price_decimals)?;
         Ok(ticks.max(1))
+    }
+
+    fn pending_cooldown(&self) -> StdDuration {
+        let extra = StdDuration::from_millis(500);
+        self.config
+            .min_quote_interval
+            .checked_add(extra)
+            .unwrap_or(self.config.min_quote_interval)
     }
 
     fn convert_order(order: &models::Order, metadata: &MarketMetadata) -> Result<ActiveOrder> {
