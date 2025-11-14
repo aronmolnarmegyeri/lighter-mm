@@ -9,24 +9,22 @@ use std::{
 use anyhow::{Context, Result, anyhow};
 use futures_util::StreamExt;
 use lighter_client::{
-    lighter_client::{Error as LighterError, LighterClient, OrderSide},
+    lighter_client::{LighterClient, OrderSide},
     models,
     types::{AccountId, ApiKeyIndex, BaseQty, Expiry, MarketId, Price},
-    ws_client::{AccountEventEnvelope, OrderBookEvent, WsEvent},
+    ws_client::{OrderBookEvent, WsEvent},
 };
 use rust_decimal::Decimal;
 use rust_decimal::prelude::{FromPrimitive, One, ToPrimitive};
-use serde_json::Value;
 use tokio::time::{self, Instant};
 use tracing::{debug, error, info, warn};
 use tracing_subscriber::EnvFilter;
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    // Load environment variables from .env file if it exists
-    dotenvy::dotenv().ok();
-
     init_tracing();
+
+    dotenvy::dotenv().ok();
 
     let config = Config::from_env()?;
     info!("loaded configuration: {:?}", config);
@@ -69,14 +67,6 @@ struct Config {
     active_order_sync_interval: StdDuration,
     min_quote_interval: StdDuration,
     post_only: bool,
-    inventory_target: Decimal,
-    max_inventory: Option<Decimal>,
-    inventory_risk_aversion: f64,
-    avellaneda_time_horizon_secs: f64,
-    avellaneda_market_depth: f64,
-    volatility_alpha: Decimal,
-    min_volatility: Decimal,
-    rate_limit_cooldown: StdDuration,
 }
 
 impl Config {
@@ -135,41 +125,10 @@ impl Config {
             .and_then(|value| value.parse::<u64>().ok())
             .map(StdDuration::from_millis)
             .unwrap_or_else(|| StdDuration::from_millis(250));
-        let rate_limit_cooldown = env::var("LIGHTER_MM_RATE_LIMIT_COOLDOWN_MS")
-            .ok()
-            .and_then(|value| value.parse::<u64>().ok())
-            .map(StdDuration::from_millis)
-            .unwrap_or_else(|| StdDuration::from_secs(2));
         let post_only = env::var("LIGHTER_MM_POST_ONLY")
             .ok()
             .map(|value| value == "1" || value.eq_ignore_ascii_case("true"))
             .unwrap_or(true);
-        let inventory_target = decimal_env("LIGHTER_MM_INVENTORY_TARGET", Decimal::ZERO)?;
-        let max_inventory = env::var("LIGHTER_MM_MAX_INVENTORY")
-            .ok()
-            .and_then(|value| Decimal::from_str(&value).ok());
-        let inventory_risk_aversion = env::var("LIGHTER_MM_RISK_AVERSION")
-            .ok()
-            .and_then(|value| value.parse::<f64>().ok())
-            .unwrap_or(0.1);
-        let avellaneda_time_horizon_secs = env::var("LIGHTER_MM_AVELLANEDA_HORIZON_SECS")
-            .ok()
-            .and_then(|value| value.parse::<f64>().ok())
-            .unwrap_or(15.0);
-        let avellaneda_market_depth = env::var("LIGHTER_MM_AVELLANEDA_DEPTH")
-            .ok()
-            .and_then(|value| value.parse::<f64>().ok())
-            .unwrap_or(1000.0);
-        let mut volatility_alpha = decimal_env("LIGHTER_MM_VOL_ALPHA", Decimal::new(2, 1))?;
-        if volatility_alpha <= Decimal::ZERO {
-            volatility_alpha = Decimal::new(2, 1);
-        } else if volatility_alpha > Decimal::ONE {
-            volatility_alpha = Decimal::ONE;
-        }
-        let mut min_volatility = decimal_env("LIGHTER_MM_MIN_VOL", Decimal::new(1, 4))?;
-        if min_volatility <= Decimal::ZERO {
-            min_volatility = Decimal::new(1, 4);
-        }
 
         Ok(Self {
             api_url,
@@ -191,14 +150,6 @@ impl Config {
             active_order_sync_interval,
             min_quote_interval,
             post_only,
-            inventory_target,
-            max_inventory,
-            inventory_risk_aversion,
-            avellaneda_time_horizon_secs,
-            avellaneda_market_depth,
-            volatility_alpha,
-            min_volatility,
-            rate_limit_cooldown,
         })
     }
 }
@@ -311,31 +262,6 @@ struct PendingOrder {
     submitted_at: Instant,
 }
 
-impl PendingOrder {
-    fn matches(&self, target: &OrderTarget, tolerance_ticks: i64, qty_tolerance: i64) -> bool {
-        if self.side != target.side {
-            return false;
-        }
-
-        if (self.price_ticks - target.price_ticks).abs() > tolerance_ticks {
-            return false;
-        }
-
-        if (self.qty_ticks - target.qty_ticks).abs() > qty_tolerance {
-            return false;
-        }
-
-        true
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ActionOutcome {
-    NoOp,
-    Executed,
-    RateLimited,
-}
-
 struct Strategy {
     config: Config,
     metadata: MarketMetadata,
@@ -348,104 +274,43 @@ struct StrategyState {
     by_client: HashMap<i64, i64>,
     pending_orders: HashMap<i64, PendingOrder>,
     matched_orders: HashSet<i64>,
-    matched_pending: HashSet<i64>,
     last_mid_price: Option<Decimal>,
     last_quote_action: Instant,
     next_client_order_id: i64,
-    inventory: Decimal,
-    volatility_var: Decimal,
-    min_volatility: Decimal,
-    rate_limit_until: Option<Instant>,
 }
 
 impl StrategyState {
-    fn new(min_quote_interval: StdDuration, min_volatility: Decimal) -> Self {
+    fn new(min_quote_interval: StdDuration) -> Self {
         let seed = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_else(|_| StdDuration::from_secs(0))
             .as_micros();
-        const MAX_CLIENT_ORDER_ID: i64 = 281_474_976_710_655; // 2^48 - 1
+        // Ensure the client order ID is within the valid range (0 to 2^48 - 1)
+        const MAX_CLIENT_ORDER_ID: i64 = 281474976710655; 
         let mut initial = (seed % MAX_CLIENT_ORDER_ID as u128) as i64;
         if initial == 0 {
             initial = 1;
         }
-        let min_volatility = if min_volatility <= Decimal::ZERO {
-            Decimal::new(1, 4)
-        } else {
-            min_volatility
-        };
-        let initial_variance = min_volatility * min_volatility;
 
         Self {
             active_orders: HashMap::new(),
             by_client: HashMap::new(),
             pending_orders: HashMap::new(),
             matched_orders: HashSet::new(),
-            matched_pending: HashSet::new(),
             last_mid_price: None,
             last_quote_action: Instant::now() - min_quote_interval,
             next_client_order_id: initial,
-            inventory: Decimal::ZERO,
-            volatility_var: initial_variance,
-            min_volatility,
-            rate_limit_until: None,
         }
     }
 
     fn next_client_order_id(&mut self) -> i64 {
-        const MAX_CLIENT_ORDER_ID: i64 = 281_474_976_710_655; // 2^48 - 1
+        // Ensure the client order ID is within the valid range (0 to 2^48 - 1)
+        const MAX_CLIENT_ORDER_ID: i64 = 281474976710655; // 2^48 - 1
         self.next_client_order_id = self.next_client_order_id.wrapping_add(1);
-        if self.next_client_order_id <= 0 || self.next_client_order_id > MAX_CLIENT_ORDER_ID {
+        if self.next_client_order_id == 0 || self.next_client_order_id > MAX_CLIENT_ORDER_ID {
             self.next_client_order_id = 1;
         }
         self.next_client_order_id
-    }
-
-    fn update_volatility(&mut self, previous: Decimal, current: Decimal, alpha: Decimal) {
-        if previous <= Decimal::ZERO || current <= Decimal::ZERO {
-            return;
-        }
-
-        let mut alpha = alpha;
-        if alpha <= Decimal::ZERO {
-            return;
-        }
-        if alpha > Decimal::ONE {
-            alpha = Decimal::ONE;
-        }
-
-        let return_ratio = (current - previous) / previous;
-        let squared_return = return_ratio * return_ratio;
-        let one_minus_alpha = Decimal::ONE - alpha;
-        self.volatility_var = self.volatility_var * one_minus_alpha + squared_return * alpha;
-    }
-
-    fn current_volatility(&self) -> Decimal {
-        let min_var = self.min_volatility * self.min_volatility;
-        let variance = if self.volatility_var < min_var {
-            min_var
-        } else {
-            self.volatility_var
-        };
-
-        let variance_f64 = variance
-            .to_f64()
-            .unwrap_or_else(|| {
-                (self.min_volatility * self.min_volatility)
-                    .to_f64()
-                    .unwrap_or(0.0)
-            })
-            .max(0.0);
-        Decimal::from_f64(variance_f64.sqrt()).unwrap_or(self.min_volatility)
-    }
-
-    fn register_rate_limit(&mut self, until: Instant) {
-        if let Some(existing) = self.rate_limit_until {
-            if existing >= until {
-                return;
-            }
-        }
-        self.rate_limit_until = Some(until);
     }
 }
 
@@ -475,13 +340,13 @@ impl Strategy {
 
         let mut strategy = Self {
             metadata,
-            state: StrategyState::new(config.min_quote_interval, config.min_volatility),
+            state: StrategyState::new(config.min_quote_interval),
             config,
             client,
         };
 
         strategy.sync_active_orders().await?;
-        strategy.log_account_snapshot().await?;
+        strategy.log_order_snapshot();
 
         Ok(strategy)
     }
@@ -491,7 +356,6 @@ impl Strategy {
             .client
             .ws()
             .subscribe_order_book(self.config.market_id)
-            .subscribe_account(self.config.account_index)
             .connect()
             .await?;
 
@@ -506,9 +370,6 @@ impl Strategy {
                     match maybe_event {
                         Some(Ok(WsEvent::OrderBook(event))) => {
                             self.handle_order_book(event).await?;
-                        }
-                        Some(Ok(WsEvent::Account(event))) => {
-                            self.handle_account_event(event)?;
                         }
                         Some(Ok(WsEvent::Connected)) => {
                             info!("websocket connected to market {}", self.config.market_id);
@@ -531,18 +392,10 @@ impl Strategy {
                     }
                 }
                 _ = account_log_interval.tick() => {
-                    if !self.rate_limit_active() {
-                        self.log_account_snapshot().await?;
-                    } else {
-                        debug!("skipping account snapshot during rate limit window");
-                    }
+                    self.log_account_snapshot().await?;
                 }
                 _ = active_sync_interval.tick() => {
-                    if !self.rate_limit_active() {
-                        self.sync_active_orders().await?;
-                    } else {
-                        debug!("skipping active order sync during rate limit window");
-                    }
+                    self.sync_active_orders().await?;
                 }
             }
         }
@@ -564,22 +417,6 @@ impl Strategy {
         MarketMetadata::from_detail(detail)
     }
 
-    fn handle_account_event(&mut self, envelope: AccountEventEnvelope) -> Result<()> {
-        let context = if envelope.snapshot {
-            "account_ws_snapshot"
-        } else {
-            "account_ws_update"
-        };
-
-        if let Some(inventory) =
-            Self::inventory_from_account_event(envelope.event.as_value(), self.config.market_id)
-        {
-            self.update_inventory(inventory, context);
-        }
-
-        Ok(())
-    }
-
     async fn handle_order_book(&mut self, event: OrderBookEvent) -> Result<()> {
         let best_bid = event
             .state
@@ -598,35 +435,13 @@ impl Strategy {
         };
 
         let mid_price = (bid + ask) / Decimal::from(2);
-        if let Some(previous_mid) = self.state.last_mid_price {
-            self.state
-                .update_volatility(previous_mid, mid_price, self.config.volatility_alpha);
-        }
         self.state.last_mid_price = Some(mid_price);
-        debug!(
-            %bid,
-            %ask,
-            %mid_price,
-            est_vol = %self.state.current_volatility(),
-            inventory = %self.state.inventory,
-            "order book tick"
-        );
+        debug!(%bid, %ask, %mid_price, "order book tick");
         self.requote(mid_price).await
     }
 
     async fn requote(&mut self, mid_price: Decimal) -> Result<()> {
         let now = Instant::now();
-        if let Some(until) = self.state.rate_limit_until {
-            if until > now {
-                let remaining = until.saturating_duration_since(now);
-                debug!(
-                    wait_ms = remaining.as_millis() as u64,
-                    "skipping requote during rate limit"
-                );
-                return Ok(());
-            }
-            self.state.rate_limit_until = None;
-        }
         if now.duration_since(self.state.last_quote_action) < self.config.min_quote_interval {
             return Ok(());
         }
@@ -635,8 +450,6 @@ impl Strategy {
         if targets.is_empty() {
             return Ok(());
         }
-
-        self.state.matched_pending.clear();
 
         let tolerance_ticks = self.price_tolerance_ticks(mid_price)?;
         self.state.matched_orders.clear();
@@ -660,12 +473,6 @@ impl Strategy {
 
             if let Some(order_index) = matched {
                 self.state.matched_orders.insert(order_index);
-            } else if let Some((client_id, _)) =
-                self.state.pending_orders.iter().find(|(_, pending)| {
-                    pending.matches(target, tolerance_ticks, self.config.qty_tolerance_ticks)
-                })
-            {
-                self.state.matched_pending.insert(*client_id);
             } else {
                 to_place.push(target.clone());
             }
@@ -680,25 +487,13 @@ impl Strategy {
 
         let mut mutated = false;
         if !to_cancel.is_empty() {
-            match self.cancel_orders(&to_cancel).await? {
-                ActionOutcome::Executed => mutated = true,
-                ActionOutcome::RateLimited => {
-                    self.state.last_quote_action = now;
-                    return Ok(());
-                }
-                ActionOutcome::NoOp => {}
-            }
+            self.cancel_orders(&to_cancel).await?;
+            mutated = true;
         }
 
         if !to_place.is_empty() {
-            match self.place_orders(&to_place).await? {
-                ActionOutcome::Executed => mutated = true,
-                ActionOutcome::RateLimited => {
-                    self.state.last_quote_action = now;
-                    return Ok(());
-                }
-                ActionOutcome::NoOp => {}
-            }
+            self.place_orders(&to_place).await?;
+            mutated = true;
         }
 
         if mutated {
@@ -709,8 +504,7 @@ impl Strategy {
         Ok(())
     }
 
-    async fn cancel_orders(&mut self, orders: &[i64]) -> Result<ActionOutcome> {
-        let mut outcome = ActionOutcome::NoOp;
+    async fn cancel_orders(&mut self, orders: &[i64]) -> Result<()> {
         for order_index in orders {
             if let Some(order) = self.state.active_orders.get(order_index) {
                 info!(
@@ -738,22 +532,17 @@ impl Strategy {
                     if let Some(order) = self.state.active_orders.remove(order_index) {
                         self.state.by_client.remove(&order.client_order_index);
                     }
-                    outcome = ActionOutcome::Executed;
                 }
                 Err(err) => {
-                    if self.process_rate_limit_error("cancel_order", &err) {
-                        return Ok(ActionOutcome::RateLimited);
-                    }
                     warn!(order_index = *order_index, ?err, "failed to cancel order");
                 }
             }
         }
 
-        Ok(outcome)
+        Ok(())
     }
 
-    async fn place_orders(&mut self, targets: &[OrderTarget]) -> Result<ActionOutcome> {
-        let mut outcome = ActionOutcome::NoOp;
+    async fn place_orders(&mut self, targets: &[OrderTarget]) -> Result<()> {
         for target in targets {
             if target.qty_ticks <= 0 {
                 continue;
@@ -814,12 +603,8 @@ impl Strategy {
                             submitted_at: Instant::now(),
                         },
                     );
-                    outcome = ActionOutcome::Executed;
                 }
                 Err(err) => {
-                    if self.process_rate_limit_error("submit_order", &err) {
-                        return Ok(ActionOutcome::RateLimited);
-                    }
                     warn!(
                         side = ?target.side,
                         level = target.level,
@@ -832,24 +617,15 @@ impl Strategy {
             }
         }
 
-        Ok(outcome)
+        Ok(())
     }
 
     async fn sync_active_orders(&mut self) -> Result<()> {
-        let response = match self
+        let response = self
             .client
             .account()
             .active_orders(self.config.market_id)
-            .await
-        {
-            Ok(response) => response,
-            Err(err) => {
-                if self.process_rate_limit_error("active_orders", &err) {
-                    return Ok(());
-                }
-                return Err(err.into());
-            }
-        };
+            .await?;
 
         let mut updated = HashMap::new();
         let mut by_client = HashMap::new();
@@ -953,19 +729,8 @@ impl Strategy {
         }
     }
 
-    async fn log_account_snapshot(&mut self) -> Result<()> {
-        let details = match self.client.account().details().await {
-            Ok(details) => details,
-            Err(err) => {
-                if self.process_rate_limit_error("account_details", &err) {
-                    return Ok(());
-                }
-                return Err(err.into());
-            }
-        };
-        let mut aggregated_inventory = Decimal::ZERO;
-        let mut inventory_found = false;
-
+    async fn log_account_snapshot(&self) -> Result<()> {
+        let details = self.client.account().details().await?;
         for account in &details.accounts {
             info!(
                 account_index = account.account_index,
@@ -992,25 +757,8 @@ impl Strategy {
                     allocated_margin = %position.allocated_margin,
                     "position snapshot"
                 );
-
-                if position.market_id == i32::from(self.config.market_id) {
-                    let quantity = Decimal::from_str(&position.position).unwrap_or(Decimal::ZERO);
-                    let signed_quantity = if position.sign < 0 {
-                        -quantity
-                    } else {
-                        quantity
-                    };
-                    aggregated_inventory += signed_quantity;
-                    inventory_found = true;
-                }
             }
         }
-
-        if !inventory_found {
-            aggregated_inventory = Decimal::ZERO;
-        }
-
-        self.update_inventory(aggregated_inventory, "account_snapshot");
 
         self.log_order_snapshot();
         Ok(())
@@ -1018,67 +766,13 @@ impl Strategy {
 
     fn build_targets(&self, mid_price: Decimal) -> Result<Vec<OrderTarget>> {
         let mut targets = Vec::with_capacity(self.config.levels * 2);
-        if mid_price <= Decimal::ZERO {
-            return Ok(targets);
-        }
-
         let bps_divisor = Decimal::from_i64(10_000).unwrap();
-        let sigma_rel = self.state.current_volatility();
-        let sigma_price = sigma_rel * mid_price;
-        let sigma_price_f64 = sigma_price.to_f64().unwrap_or(0.0);
-        let mut gamma_term = 0.0;
-        let mut depth_term = 0.0;
-        let gamma = self.config.inventory_risk_aversion.max(0.0);
-        let tau = self.config.avellaneda_time_horizon_secs.max(0.0);
-        let depth = self.config.avellaneda_market_depth.max(0.0);
-
-        if gamma > f64::EPSILON && tau > f64::EPSILON {
-            let sigma_sq = sigma_price_f64 * sigma_price_f64;
-            gamma_term = gamma * sigma_sq * tau;
-            if depth > f64::EPSILON {
-                depth_term = (2.0 / gamma) * ((1.0 + gamma / depth).ln());
-            }
-        }
-
-        let avellaneda_spread =
-            Decimal::from_f64((gamma_term + depth_term) / 2.0).unwrap_or(Decimal::ZERO);
-        let spread_fraction = self.config.base_spread_bps / bps_divisor;
-        let mut base_half_spread = (mid_price * spread_fraction)
-            .round_dp(self.metadata.price_decimals)
-            + avellaneda_spread;
-        base_half_spread = base_half_spread.max(self.metadata.price_tick());
-
-        let level_spacing_fraction = self.config.level_spacing_bps / bps_divisor;
-        let level_spacing =
-            (mid_price * level_spacing_fraction).round_dp(self.metadata.price_decimals);
-
-        let inventory_offset = if gamma > f64::EPSILON {
-            let q = (self.state.inventory - self.config.inventory_target)
-                .to_f64()
-                .unwrap_or(0.0);
-            Decimal::from_f64(gamma_term * q).unwrap_or(Decimal::ZERO)
-        } else {
-            Decimal::ZERO
-        };
-
-        let mut reservation_price = (mid_price - inventory_offset).max(self.metadata.price_tick());
-        if reservation_price <= Decimal::ZERO {
-            reservation_price = self.metadata.price_tick();
-        }
-
-        debug!(
-            %mid_price,
-            sigma_rel = %sigma_rel,
-            sigma_price = %sigma_price,
-            reservation_price = %reservation_price,
-            half_spread = %base_half_spread,
-            inventory = %self.state.inventory,
-            inventory_target = %self.config.inventory_target,
-            "computed avellaneda targets"
-        );
 
         for level in 0..self.config.levels {
             let level_decimal = Decimal::from_i64(level as i64).unwrap_or(Decimal::ZERO);
+            let spread_bps =
+                self.config.base_spread_bps + self.config.level_spacing_bps * level_decimal;
+            let spread_fraction = spread_bps / bps_divisor;
             let mut size_multiplier = Decimal::ONE;
             if level > 0 {
                 size_multiplier = (0..level).fold(Decimal::ONE, |acc, _| {
@@ -1093,12 +787,11 @@ impl Strategy {
                 continue;
             }
 
-            let level_half_spread =
-                (base_half_spread + level_spacing * level_decimal).max(self.metadata.price_tick());
-
-            let bid_price = (reservation_price - level_half_spread)
-                .max(self.metadata.price_tick())
+            let bid_price = (mid_price * (Decimal::one() - spread_fraction))
                 .round_dp(self.metadata.price_decimals);
+            let ask_price = (mid_price * (Decimal::one() + spread_fraction))
+                .round_dp(self.metadata.price_decimals);
+
             if bid_price > Decimal::ZERO {
                 let price_ticks = decimal_to_scaled_i64(bid_price, self.metadata.price_decimals)?;
                 let qty_ticks = decimal_to_scaled_i64(quantity, self.metadata.size_decimals)?;
@@ -1112,8 +805,6 @@ impl Strategy {
                 });
             }
 
-            let ask_price =
-                (reservation_price + level_half_spread).round_dp(self.metadata.price_decimals);
             if ask_price > Decimal::ZERO {
                 let price_ticks = decimal_to_scaled_i64(ask_price, self.metadata.price_decimals)?;
                 let qty_ticks = decimal_to_scaled_i64(quantity, self.metadata.size_decimals)?;
@@ -1136,93 +827,6 @@ impl Strategy {
         let tolerance_price = (mid_price * fraction).max(self.metadata.price_tick());
         let ticks = decimal_to_scaled_i64(tolerance_price, self.metadata.price_decimals)?;
         Ok(ticks.max(1))
-    }
-
-    fn inventory_from_account_event(value: &Value, market: MarketId) -> Option<Decimal> {
-        let mut total = Decimal::ZERO;
-        let mut found = false;
-        Self::walk_account_value(value, market, &mut total, &mut found);
-        if found { Some(total) } else { None }
-    }
-
-    fn walk_account_value(value: &Value, market: MarketId, total: &mut Decimal, found: &mut bool) {
-        match value {
-            Value::Object(map) => {
-                if let Some(positions) = map.get("positions").and_then(|v| v.as_array()) {
-                    Self::accumulate_positions(positions, market, total, found);
-                }
-                for child in map.values() {
-                    Self::walk_account_value(child, market, total, found);
-                }
-            }
-            Value::Array(array) => {
-                for child in array {
-                    Self::walk_account_value(child, market, total, found);
-                }
-            }
-            _ => {}
-        }
-    }
-
-    fn accumulate_positions(
-        positions: &[Value],
-        market: MarketId,
-        total: &mut Decimal,
-        found: &mut bool,
-    ) {
-        for position in positions {
-            let Some(obj) = position.as_object() else {
-                continue;
-            };
-            let Some(market_id) = obj.get("market_id").and_then(Self::value_to_i32) else {
-                continue;
-            };
-            if market_id != i32::from(market) {
-                continue;
-            }
-
-            let quantity = obj
-                .get("position")
-                .and_then(Self::value_to_decimal)
-                .unwrap_or(Decimal::ZERO);
-            let sign = obj
-                .get("sign")
-                .and_then(Self::value_to_i64)
-                .unwrap_or_else(|| if quantity.is_sign_negative() { -1 } else { 1 });
-
-            let signed_quantity = if sign < 0 {
-                -quantity.abs()
-            } else {
-                quantity.abs()
-            };
-
-            *total += signed_quantity;
-            *found = true;
-        }
-    }
-
-    fn value_to_decimal(value: &Value) -> Option<Decimal> {
-        match value {
-            Value::String(text) => Decimal::from_str(text).ok(),
-            Value::Number(num) => num.as_f64().and_then(Decimal::from_f64),
-            _ => None,
-        }
-    }
-
-    fn value_to_i32(value: &Value) -> Option<i32> {
-        match value {
-            Value::Number(num) => num.as_i64().map(|v| v as i32),
-            Value::String(text) => text.parse::<i32>().ok(),
-            _ => None,
-        }
-    }
-
-    fn value_to_i64(value: &Value) -> Option<i64> {
-        match value {
-            Value::Number(num) => num.as_i64(),
-            Value::String(text) => text.parse::<i64>().ok(),
-            _ => None,
-        }
     }
 
     fn convert_order(order: &models::Order, metadata: &MarketMetadata) -> Result<ActiveOrder> {
@@ -1256,94 +860,6 @@ impl Strategy {
             created_at,
             expires_at,
         })
-    }
-
-    fn clamp_inventory(&self, inventory: Decimal) -> Decimal {
-        if let Some(max_inventory) = self.config.max_inventory {
-            if max_inventory > Decimal::ZERO {
-                if inventory > max_inventory {
-                    return max_inventory;
-                } else if inventory < -max_inventory {
-                    return -max_inventory;
-                }
-            }
-        }
-        inventory
-    }
-
-    fn update_inventory(&mut self, new_inventory: Decimal, source: &str) {
-        let clamped = self.clamp_inventory(new_inventory);
-        if clamped != self.state.inventory {
-            info!(
-                market_id = i32::from(self.config.market_id),
-                previous_inventory = %self.state.inventory,
-                inventory = %clamped,
-                target = %self.config.inventory_target,
-                source,
-                "updated inventory",
-            );
-        }
-
-        self.state.inventory = clamped;
-
-        info!(
-            market_id = i32::from(self.config.market_id),
-            inventory = %self.state.inventory,
-            target = %self.config.inventory_target,
-            est_volatility = %self.state.current_volatility(),
-            source,
-            "risk snapshot",
-        );
-    }
-
-    fn rate_limit_active(&mut self) -> bool {
-        if let Some(until) = self.state.rate_limit_until {
-            if Instant::now() >= until {
-                self.state.rate_limit_until = None;
-                false
-            } else {
-                true
-            }
-        } else {
-            false
-        }
-    }
-
-    fn handle_rate_limit(&mut self, source: &str, retry_after: Option<u64>) {
-        let wait = retry_after
-            .and_then(|secs| {
-                if secs > 0 {
-                    Some(StdDuration::from_secs(secs))
-                } else {
-                    None
-                }
-            })
-            .unwrap_or(self.config.rate_limit_cooldown);
-        let until = Instant::now() + wait;
-        self.state.register_rate_limit(until);
-        warn!(
-            %source,
-            wait_secs = wait.as_secs_f64(),
-            "rate limited; backing off order actions"
-        );
-    }
-
-    fn process_rate_limit_error(&mut self, source: &str, err: &LighterError) -> bool {
-        match err {
-            LighterError::RateLimited { retry_after } => {
-                self.handle_rate_limit(source, *retry_after);
-                true
-            }
-            LighterError::Http { status, .. } if *status == 429 => {
-                self.handle_rate_limit(source, None);
-                true
-            }
-            LighterError::Server { status, .. } if *status == 429 => {
-                self.handle_rate_limit(source, None);
-                true
-            }
-            _ => false,
-        }
     }
 }
 
