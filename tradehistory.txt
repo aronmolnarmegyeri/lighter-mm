@@ -1,0 +1,100 @@
+Market
+Side
+Date
+Trade Value
+Size
+Price
+Closed PnL
+Fee
+Role
+Type
+ETH
+Open Long
+11/14/2025 18:46:13
+$16.02
+0.0050
+$3,204.85
+-
+$0.00
+Maker
+Trade
+ETH
+Open Long
+11/14/2025 18:46:11
+$16.02
+0.0050
+$3,204.21
+-
+$0.00
+Maker
+Trade
+ETH
+Open Long
+11/14/2025 18:46:11
+$15.38
+0.0048
+$3,204.21
+-
+$0.00
+Maker
+Trade
+ETH
+Open Long
+11/14/2025 18:46:11
+$0.64
+0.0002
+$3,204.21
+-
+$0.00
+Maker
+Trade
+ETH
+Open Long
+11/14/2025 18:46:08
+$16.02
+0.0050
+$3,204.85
+-
+$0.00
+Maker
+Trade
+ETH
+Open Long
+11/14/2025 18:46:05
+$1.92
+0.0006
+$3,204.99
+-
+$0.00
+Maker
+Trade
+ETH
+Open Long
+11/14/2025 18:46:05
+$14.10
+0.0044
+$3,204.99
+-
+$0.00
+Maker
+Trade
+ETH
+Open Long
+11/14/2025 18:46:05
+$16.03
+0.0050
+$3,205.53
+-
+$0.00
+Maker
+Trade
+ETH
+Open Long
+11/14/2025 18:46:05
+$16.03
+0.0050
+$3,205.53
+-
+$0.00
+Maker
+Trade
