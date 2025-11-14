@@ -22,6 +22,9 @@ use tracing_subscriber::EnvFilter;
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    // Load environment variables from .env file if it exists
+    dotenvy::dotenv().ok();
+
     init_tracing();
 
     let config = Config::from_env()?;
@@ -65,6 +68,13 @@ struct Config {
     active_order_sync_interval: StdDuration,
     min_quote_interval: StdDuration,
     post_only: bool,
+    inventory_target: Decimal,
+    max_inventory: Option<Decimal>,
+    inventory_risk_aversion: f64,
+    avellaneda_time_horizon_secs: f64,
+    avellaneda_market_depth: f64,
+    volatility_alpha: Decimal,
+    min_volatility: Decimal,
 }
 
 impl Config {
@@ -127,6 +137,32 @@ impl Config {
             .ok()
             .map(|value| value == "1" || value.eq_ignore_ascii_case("true"))
             .unwrap_or(true);
+        let inventory_target = decimal_env("LIGHTER_MM_INVENTORY_TARGET", Decimal::ZERO)?;
+        let max_inventory = env::var("LIGHTER_MM_MAX_INVENTORY")
+            .ok()
+            .and_then(|value| Decimal::from_str(&value).ok());
+        let inventory_risk_aversion = env::var("LIGHTER_MM_RISK_AVERSION")
+            .ok()
+            .and_then(|value| value.parse::<f64>().ok())
+            .unwrap_or(0.1);
+        let avellaneda_time_horizon_secs = env::var("LIGHTER_MM_AVELLANEDA_HORIZON_SECS")
+            .ok()
+            .and_then(|value| value.parse::<f64>().ok())
+            .unwrap_or(15.0);
+        let avellaneda_market_depth = env::var("LIGHTER_MM_AVELLANEDA_DEPTH")
+            .ok()
+            .and_then(|value| value.parse::<f64>().ok())
+            .unwrap_or(1000.0);
+        let mut volatility_alpha = decimal_env("LIGHTER_MM_VOL_ALPHA", Decimal::new(2, 1))?;
+        if volatility_alpha <= Decimal::ZERO {
+            volatility_alpha = Decimal::new(2, 1);
+        } else if volatility_alpha > Decimal::ONE {
+            volatility_alpha = Decimal::ONE;
+        }
+        let mut min_volatility = decimal_env("LIGHTER_MM_MIN_VOL", Decimal::new(1, 4))?;
+        if min_volatility <= Decimal::ZERO {
+            min_volatility = Decimal::new(1, 4);
+        }
 
         Ok(Self {
             api_url,
@@ -148,6 +184,13 @@ impl Config {
             active_order_sync_interval,
             min_quote_interval,
             post_only,
+            inventory_target,
+            max_inventory,
+            inventory_risk_aversion,
+            avellaneda_time_horizon_secs,
+            avellaneda_market_depth,
+            volatility_alpha,
+            min_volatility,
         })
     }
 }
@@ -275,18 +318,28 @@ struct StrategyState {
     last_mid_price: Option<Decimal>,
     last_quote_action: Instant,
     next_client_order_id: i64,
+    inventory: Decimal,
+    volatility_var: Decimal,
+    min_volatility: Decimal,
 }
 
 impl StrategyState {
-    fn new(min_quote_interval: StdDuration) -> Self {
+    fn new(min_quote_interval: StdDuration, min_volatility: Decimal) -> Self {
         let seed = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_else(|_| StdDuration::from_secs(0))
             .as_micros();
-        let mut initial = (seed % i64::MAX as u128) as i64;
+        const MAX_CLIENT_ORDER_ID: i64 = 281_474_976_710_655; // 2^48 - 1
+        let mut initial = (seed % MAX_CLIENT_ORDER_ID as u128) as i64;
         if initial == 0 {
             initial = 1;
         }
+        let min_volatility = if min_volatility <= Decimal::ZERO {
+            Decimal::new(1, 4)
+        } else {
+            min_volatility
+        };
+        let initial_variance = min_volatility * min_volatility;
 
         Self {
             active_orders: HashMap::new(),
@@ -296,15 +349,57 @@ impl StrategyState {
             last_mid_price: None,
             last_quote_action: Instant::now() - min_quote_interval,
             next_client_order_id: initial,
+            inventory: Decimal::ZERO,
+            volatility_var: initial_variance,
+            min_volatility,
         }
     }
 
     fn next_client_order_id(&mut self) -> i64 {
+        const MAX_CLIENT_ORDER_ID: i64 = 281_474_976_710_655; // 2^48 - 1
         self.next_client_order_id = self.next_client_order_id.wrapping_add(1);
-        if self.next_client_order_id == 0 {
+        if self.next_client_order_id <= 0 || self.next_client_order_id > MAX_CLIENT_ORDER_ID {
             self.next_client_order_id = 1;
         }
         self.next_client_order_id
+    }
+
+    fn update_volatility(&mut self, previous: Decimal, current: Decimal, alpha: Decimal) {
+        if previous <= Decimal::ZERO || current <= Decimal::ZERO {
+            return;
+        }
+
+        let mut alpha = alpha;
+        if alpha <= Decimal::ZERO {
+            return;
+        }
+        if alpha > Decimal::ONE {
+            alpha = Decimal::ONE;
+        }
+
+        let return_ratio = (current - previous) / previous;
+        let squared_return = return_ratio * return_ratio;
+        let one_minus_alpha = Decimal::ONE - alpha;
+        self.volatility_var = self.volatility_var * one_minus_alpha + squared_return * alpha;
+    }
+
+    fn current_volatility(&self) -> Decimal {
+        let min_var = self.min_volatility * self.min_volatility;
+        let variance = if self.volatility_var < min_var {
+            min_var
+        } else {
+            self.volatility_var
+        };
+
+        let variance_f64 = variance
+            .to_f64()
+            .unwrap_or_else(|| {
+                (self.min_volatility * self.min_volatility)
+                    .to_f64()
+                    .unwrap_or(0.0)
+            })
+            .max(0.0);
+        Decimal::from_f64(variance_f64.sqrt()).unwrap_or(self.min_volatility)
     }
 }
 
@@ -334,13 +429,13 @@ impl Strategy {
 
         let mut strategy = Self {
             metadata,
-            state: StrategyState::new(config.min_quote_interval),
+            state: StrategyState::new(config.min_quote_interval, config.min_volatility),
             config,
             client,
         };
 
         strategy.sync_active_orders().await?;
-        strategy.log_order_snapshot();
+        strategy.log_account_snapshot().await?;
 
         Ok(strategy)
     }
@@ -429,8 +524,19 @@ impl Strategy {
         };
 
         let mid_price = (bid + ask) / Decimal::from(2);
+        if let Some(previous_mid) = self.state.last_mid_price {
+            self.state
+                .update_volatility(previous_mid, mid_price, self.config.volatility_alpha);
+        }
         self.state.last_mid_price = Some(mid_price);
-        debug!(%bid, %ask, %mid_price, "order book tick");
+        debug!(
+            %bid,
+            %ask,
+            %mid_price,
+            est_vol = %self.state.current_volatility(),
+            inventory = %self.state.inventory,
+            "order book tick"
+        );
         self.requote(mid_price).await
     }
 
@@ -723,8 +829,11 @@ impl Strategy {
         }
     }
 
-    async fn log_account_snapshot(&self) -> Result<()> {
+    async fn log_account_snapshot(&mut self) -> Result<()> {
         let details = self.client.account().details().await?;
+        let mut aggregated_inventory = Decimal::ZERO;
+        let mut inventory_found = false;
+
         for account in &details.accounts {
             info!(
                 account_index = account.account_index,
@@ -751,8 +860,53 @@ impl Strategy {
                     allocated_margin = %position.allocated_margin,
                     "position snapshot"
                 );
+
+                if position.market_id == i32::from(self.config.market_id) {
+                    let quantity = Decimal::from_str(&position.position).unwrap_or(Decimal::ZERO);
+                    let signed_quantity = if position.sign < 0 {
+                        -quantity
+                    } else {
+                        quantity
+                    };
+                    aggregated_inventory += signed_quantity;
+                    inventory_found = true;
+                }
             }
         }
+
+        if !inventory_found {
+            aggregated_inventory = Decimal::ZERO;
+        }
+
+        if let Some(max_inventory) = self.config.max_inventory {
+            if max_inventory > Decimal::ZERO {
+                if aggregated_inventory > max_inventory {
+                    aggregated_inventory = max_inventory;
+                } else if aggregated_inventory < -max_inventory {
+                    aggregated_inventory = -max_inventory;
+                }
+            }
+        }
+
+        if aggregated_inventory != self.state.inventory {
+            info!(
+                market_id = i32::from(self.config.market_id),
+                previous_inventory = %self.state.inventory,
+                inventory = %aggregated_inventory,
+                target = %self.config.inventory_target,
+                "updated inventory from account snapshot"
+            );
+        }
+
+        self.state.inventory = aggregated_inventory;
+
+        info!(
+            market_id = i32::from(self.config.market_id),
+            inventory = %self.state.inventory,
+            target = %self.config.inventory_target,
+            est_volatility = %self.state.current_volatility(),
+            "risk snapshot"
+        );
 
         self.log_order_snapshot();
         Ok(())
@@ -760,13 +914,67 @@ impl Strategy {
 
     fn build_targets(&self, mid_price: Decimal) -> Result<Vec<OrderTarget>> {
         let mut targets = Vec::with_capacity(self.config.levels * 2);
+        if mid_price <= Decimal::ZERO {
+            return Ok(targets);
+        }
+
         let bps_divisor = Decimal::from_i64(10_000).unwrap();
+        let sigma_rel = self.state.current_volatility();
+        let sigma_price = sigma_rel * mid_price;
+        let sigma_price_f64 = sigma_price.to_f64().unwrap_or(0.0);
+        let mut gamma_term = 0.0;
+        let mut depth_term = 0.0;
+        let gamma = self.config.inventory_risk_aversion.max(0.0);
+        let tau = self.config.avellaneda_time_horizon_secs.max(0.0);
+        let depth = self.config.avellaneda_market_depth.max(0.0);
+
+        if gamma > f64::EPSILON && tau > f64::EPSILON {
+            let sigma_sq = sigma_price_f64 * sigma_price_f64;
+            gamma_term = gamma * sigma_sq * tau;
+            if depth > f64::EPSILON {
+                depth_term = (2.0 / gamma) * ((1.0 + gamma / depth).ln());
+            }
+        }
+
+        let avellaneda_spread =
+            Decimal::from_f64((gamma_term + depth_term) / 2.0).unwrap_or(Decimal::ZERO);
+        let spread_fraction = self.config.base_spread_bps / bps_divisor;
+        let mut base_half_spread = (mid_price * spread_fraction)
+            .round_dp(self.metadata.price_decimals)
+            + avellaneda_spread;
+        base_half_spread = base_half_spread.max(self.metadata.price_tick());
+
+        let level_spacing_fraction = self.config.level_spacing_bps / bps_divisor;
+        let level_spacing =
+            (mid_price * level_spacing_fraction).round_dp(self.metadata.price_decimals);
+
+        let inventory_offset = if gamma > f64::EPSILON {
+            let q = (self.state.inventory - self.config.inventory_target)
+                .to_f64()
+                .unwrap_or(0.0);
+            Decimal::from_f64(gamma_term * q).unwrap_or(Decimal::ZERO)
+        } else {
+            Decimal::ZERO
+        };
+
+        let mut reservation_price = (mid_price - inventory_offset).max(self.metadata.price_tick());
+        if reservation_price <= Decimal::ZERO {
+            reservation_price = self.metadata.price_tick();
+        }
+
+        debug!(
+            %mid_price,
+            sigma_rel = %sigma_rel,
+            sigma_price = %sigma_price,
+            reservation_price = %reservation_price,
+            half_spread = %base_half_spread,
+            inventory = %self.state.inventory,
+            inventory_target = %self.config.inventory_target,
+            "computed avellaneda targets"
+        );
 
         for level in 0..self.config.levels {
             let level_decimal = Decimal::from_i64(level as i64).unwrap_or(Decimal::ZERO);
-            let spread_bps =
-                self.config.base_spread_bps + self.config.level_spacing_bps * level_decimal;
-            let spread_fraction = spread_bps / bps_divisor;
             let mut size_multiplier = Decimal::ONE;
             if level > 0 {
                 size_multiplier = (0..level).fold(Decimal::ONE, |acc, _| {
@@ -781,11 +989,12 @@ impl Strategy {
                 continue;
             }
 
-            let bid_price = (mid_price * (Decimal::one() - spread_fraction))
-                .round_dp(self.metadata.price_decimals);
-            let ask_price = (mid_price * (Decimal::one() + spread_fraction))
-                .round_dp(self.metadata.price_decimals);
+            let level_half_spread =
+                (base_half_spread + level_spacing * level_decimal).max(self.metadata.price_tick());
 
+            let bid_price = (reservation_price - level_half_spread)
+                .max(self.metadata.price_tick())
+                .round_dp(self.metadata.price_decimals);
             if bid_price > Decimal::ZERO {
                 let price_ticks = decimal_to_scaled_i64(bid_price, self.metadata.price_decimals)?;
                 let qty_ticks = decimal_to_scaled_i64(quantity, self.metadata.size_decimals)?;
@@ -799,6 +1008,8 @@ impl Strategy {
                 });
             }
 
+            let ask_price =
+                (reservation_price + level_half_spread).round_dp(self.metadata.price_decimals);
             if ask_price > Decimal::ZERO {
                 let price_ticks = decimal_to_scaled_i64(ask_price, self.metadata.price_decimals)?;
                 let qty_ticks = decimal_to_scaled_i64(quantity, self.metadata.size_decimals)?;
