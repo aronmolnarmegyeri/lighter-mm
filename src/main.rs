@@ -67,6 +67,10 @@ struct Config {
     active_order_sync_interval: StdDuration,
     min_quote_interval: StdDuration,
     post_only: bool,
+    inventory_soft_limit: Decimal,
+    inventory_hard_limit: Decimal,
+    inventory_skew_bps: Decimal,
+    inventory_size_skew: Decimal,
 }
 
 impl Config {
@@ -129,6 +133,10 @@ impl Config {
             .ok()
             .map(|value| value == "1" || value.eq_ignore_ascii_case("true"))
             .unwrap_or(true);
+        let inventory_soft_limit = decimal_env("LIGHTER_MM_INV_SOFT_LIMIT", Decimal::new(10, 3))?;
+        let inventory_hard_limit = decimal_env("LIGHTER_MM_INV_HARD_LIMIT", Decimal::new(20, 3))?;
+        let inventory_skew_bps = decimal_env("LIGHTER_MM_INV_SKEW_BPS", Decimal::from(40))?;
+        let inventory_size_skew = decimal_env("LIGHTER_MM_INV_SIZE_SKEW", Decimal::new(5, 1))?;
 
         Ok(Self {
             api_url,
@@ -150,6 +158,10 @@ impl Config {
             active_order_sync_interval,
             min_quote_interval,
             post_only,
+            inventory_soft_limit,
+            inventory_hard_limit,
+            inventory_skew_bps,
+            inventory_size_skew,
         })
     }
 }
@@ -277,6 +289,10 @@ struct StrategyState {
     last_mid_price: Option<Decimal>,
     last_quote_action: Instant,
     next_client_order_id: i64,
+    position_base: Decimal,
+    last_best_bid: Option<Decimal>,
+    last_best_ask: Option<Decimal>,
+    last_rebalance_action: Option<Instant>,
 }
 
 impl StrategyState {
@@ -300,6 +316,10 @@ impl StrategyState {
             last_mid_price: None,
             last_quote_action: Instant::now() - min_quote_interval,
             next_client_order_id: initial,
+            position_base: Decimal::ZERO,
+            last_best_bid: None,
+            last_best_ask: None,
+            last_rebalance_action: None,
         }
     }
 
@@ -470,6 +490,8 @@ impl Strategy {
             _ => return Ok(()),
         };
 
+        self.state.last_best_bid = Some(bid);
+        self.state.last_best_ask = Some(ask);
         let mid_price = (bid + ask) / Decimal::from(2);
         self.state.last_mid_price = Some(mid_price);
         debug!(%bid, %ask, %mid_price, "order book tick");
@@ -481,6 +503,8 @@ impl Strategy {
         if now.duration_since(self.state.last_quote_action) < self.config.min_quote_interval {
             return Ok(());
         }
+
+        self.maybe_rebalance_inventory().await?;
 
         let targets = self.build_targets(mid_price)?;
         if targets.is_empty() {
@@ -777,7 +801,7 @@ impl Strategy {
         }
     }
 
-    async fn log_account_snapshot(&self) -> Result<()> {
+    async fn log_account_snapshot(&mut self) -> Result<()> {
         let details = self.client.account().details().await?;
         for account in &details.accounts {
             info!(
@@ -805,6 +829,12 @@ impl Strategy {
                     allocated_margin = %position.allocated_margin,
                     "position snapshot"
                 );
+
+                if position.market_id == i32::from(self.config.market_id) {
+                    if let Ok(p) = Decimal::from_str(&position.position) {
+                        self.state.position_base = p;
+                    }
+                }
             }
         }
 
@@ -816,11 +846,34 @@ impl Strategy {
         let mut targets = Vec::with_capacity(self.config.levels * 2);
         let bps_divisor = Decimal::from_i64(10_000).unwrap();
 
+        let pos = self.state.position_base;
+        let soft = self.config.inventory_soft_limit;
+
+        let inv_norm = if soft > Decimal::ZERO {
+            let normalized = pos / soft;
+            let one = Decimal::ONE;
+            let neg_one = -Decimal::ONE;
+            normalized.max(neg_one).min(one)
+        } else {
+            Decimal::ZERO
+        };
+
+        let skew_bps = self.config.inventory_skew_bps * inv_norm;
+        let size_skew_factor = self.config.inventory_size_skew * inv_norm;
+
+        let hard = self.config.inventory_hard_limit;
+        let too_long = hard > Decimal::ZERO && pos > hard;
+        let too_short = hard > Decimal::ZERO && pos < -hard;
+
         for level in 0..self.config.levels {
             let level_decimal = Decimal::from_i64(level as i64).unwrap_or(Decimal::ZERO);
-            let spread_bps =
+            let base_spread_bps =
                 self.config.base_spread_bps + self.config.level_spacing_bps * level_decimal;
-            let spread_fraction = spread_bps / bps_divisor;
+            let bid_spread_bps = (base_spread_bps + skew_bps).max(Decimal::from(1));
+            let ask_spread_bps = (base_spread_bps - skew_bps).max(Decimal::from(1));
+            let bid_spread_fraction = bid_spread_bps / bps_divisor;
+            let ask_spread_fraction = ask_spread_bps / bps_divisor;
+
             let mut size_multiplier = Decimal::ONE;
             if level > 0 {
                 size_multiplier = (0..level).fold(Decimal::ONE, |acc, _| {
@@ -828,46 +881,155 @@ impl Strategy {
                 });
             }
 
-            let quantity = (self.config.base_order_size * size_multiplier)
+            let base_quantity = (self.config.base_order_size * size_multiplier)
                 .round_dp(self.metadata.size_decimals);
 
-            if quantity <= Decimal::ZERO {
+            if base_quantity <= Decimal::ZERO {
                 continue;
             }
 
-            let bid_price = (mid_price * (Decimal::one() - spread_fraction))
-                .round_dp(self.metadata.price_decimals);
-            let ask_price = (mid_price * (Decimal::one() + spread_fraction))
-                .round_dp(self.metadata.price_decimals);
+            let bid_factor = (Decimal::ONE - size_skew_factor).max(Decimal::ZERO);
+            let ask_factor = (Decimal::ONE + size_skew_factor).max(Decimal::ZERO);
 
-            if bid_price > Decimal::ZERO {
-                let price_ticks = decimal_to_scaled_i64(bid_price, self.metadata.price_decimals)?;
-                let qty_ticks = decimal_to_scaled_i64(quantity, self.metadata.size_decimals)?;
-                targets.push(OrderTarget {
-                    side: OrderSide::Bid,
-                    level,
-                    price: bid_price,
-                    price_ticks,
-                    quantity,
-                    qty_ticks,
-                });
+            let bid_quantity = (base_quantity * bid_factor)
+                .round_dp(self.metadata.size_decimals)
+                .max(self.metadata.min_base);
+            let ask_quantity = (base_quantity * ask_factor)
+                .round_dp(self.metadata.size_decimals)
+                .max(self.metadata.min_base);
+
+            if !too_long {
+                let bid_price = (mid_price * (Decimal::one() - bid_spread_fraction))
+                    .round_dp(self.metadata.price_decimals);
+                if bid_price > Decimal::ZERO {
+                    let price_ticks =
+                        decimal_to_scaled_i64(bid_price, self.metadata.price_decimals)?;
+                    let qty_ticks =
+                        decimal_to_scaled_i64(bid_quantity, self.metadata.size_decimals)?;
+                    if qty_ticks >= self.metadata.min_base_ticks {
+                        targets.push(OrderTarget {
+                            side: OrderSide::Bid,
+                            level,
+                            price: bid_price,
+                            price_ticks,
+                            quantity: bid_quantity,
+                            qty_ticks,
+                        });
+                    }
+                }
             }
 
-            if ask_price > Decimal::ZERO {
-                let price_ticks = decimal_to_scaled_i64(ask_price, self.metadata.price_decimals)?;
-                let qty_ticks = decimal_to_scaled_i64(quantity, self.metadata.size_decimals)?;
-                targets.push(OrderTarget {
-                    side: OrderSide::Ask,
-                    level,
-                    price: ask_price,
-                    price_ticks,
-                    quantity,
-                    qty_ticks,
-                });
+            if !too_short {
+                let ask_price = (mid_price * (Decimal::one() + ask_spread_fraction))
+                    .round_dp(self.metadata.price_decimals);
+                if ask_price > Decimal::ZERO {
+                    let price_ticks =
+                        decimal_to_scaled_i64(ask_price, self.metadata.price_decimals)?;
+                    let qty_ticks =
+                        decimal_to_scaled_i64(ask_quantity, self.metadata.size_decimals)?;
+                    if qty_ticks >= self.metadata.min_base_ticks {
+                        targets.push(OrderTarget {
+                            side: OrderSide::Ask,
+                            level,
+                            price: ask_price,
+                            price_ticks,
+                            quantity: ask_quantity,
+                            qty_ticks,
+                        });
+                    }
+                }
             }
         }
 
         Ok(targets)
+    }
+
+    async fn maybe_rebalance_inventory(&mut self) -> Result<()> {
+        let now = Instant::now();
+        if let Some(last) = self.state.last_rebalance_action {
+            if now
+                .checked_duration_since(last)
+                .map(|elapsed| elapsed < StdDuration::from_secs(2))
+                .unwrap_or(false)
+            {
+                return Ok(());
+            }
+        }
+
+        let pos = self.state.position_base;
+        let hard = self.config.inventory_hard_limit;
+        if hard <= Decimal::ZERO {
+            return Ok(());
+        }
+
+        let three = Decimal::from_i64(3).unwrap();
+        let two = Decimal::from_i64(2).unwrap();
+        let threshold = hard * three / two;
+        if pos.abs() <= threshold {
+            return Ok(());
+        }
+
+        let (best_bid, best_ask) = match (self.state.last_best_bid, self.state.last_best_ask) {
+            (Some(bid), Some(ask)) => (bid, ask),
+            _ => return Ok(()),
+        };
+
+        let side = if pos > Decimal::ZERO {
+            OrderSide::Ask
+        } else {
+            OrderSide::Bid
+        };
+
+        let excess = pos.abs() - hard;
+        let max_rebalance = self.config.base_order_size * Decimal::from_i64(2).unwrap();
+        let qty = excess.min(max_rebalance);
+        let qty_ticks = decimal_to_scaled_i64(qty, self.metadata.size_decimals)?;
+        if qty_ticks < self.metadata.min_base_ticks {
+            return Ok(());
+        }
+
+        let price = match side {
+            OrderSide::Ask => best_bid,
+            OrderSide::Bid => best_ask,
+        };
+        let price_ticks = decimal_to_scaled_i64(price, self.metadata.price_decimals)?;
+
+        let qty_base = BaseQty::try_from(qty_ticks)
+            .map_err(|_| anyhow!("rebalance quantity must be positive"))?;
+        let expiry = Expiry::from_now(::time::Duration::seconds(self.config.order_expiry_secs));
+        let client_order_index = self.state.next_client_order_id();
+
+        let builder = match side {
+            OrderSide::Bid => self.client.order(self.config.market_id).buy(),
+            OrderSide::Ask => self.client.order(self.config.market_id).sell(),
+        };
+
+        match builder
+            .with_client_order_id(client_order_index)
+            .qty(qty_base)
+            .limit(Price::ticks(price_ticks))
+            .expires_at(expiry)
+            .submit()
+            .await
+        {
+            Ok(submission) => {
+                info!(
+                    side = ?side,
+                    client_order_index,
+                    price = %price,
+                    qty = %qty,
+                    "submitted inventory rebalance taker order tx={}",
+                    submission.response().tx_hash
+                );
+            }
+            Err(err) => {
+                warn!(?err, "failed to submit inventory rebalance order");
+            }
+        }
+
+        self.state.last_rebalance_action = Some(now);
+
+        Ok(())
     }
 
     fn price_tolerance_ticks(&self, mid_price: Decimal) -> Result<i64> {
