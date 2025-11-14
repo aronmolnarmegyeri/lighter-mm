@@ -637,19 +637,39 @@ impl Strategy {
             let price = Price::ticks(target.price_ticks);
             let client_order_index = self.state.next_client_order_id();
 
-            let builder = match target.side {
+            let side_builder = match target.side {
                 OrderSide::Bid => self.client.order(self.config.market_id).buy(),
                 OrderSide::Ask => self.client.order(self.config.market_id).sell(),
             };
 
-            let mut builder = builder
+            let mut builder = side_builder
                 .with_client_order_id(client_order_index)
                 .qty(qty)
                 .limit(price)
                 .expires_at(expiry);
 
-            if self.config.post_only {
+            let position = self.state.position_base;
+            let is_inventory_reducing = match target.side {
+                OrderSide::Bid => position < Decimal::ZERO,
+                OrderSide::Ask => position > Decimal::ZERO,
+            };
+
+            let hard = self.config.inventory_hard_limit;
+            let allow_taker_to_flatten =
+                hard > Decimal::ZERO && position.abs() >= hard && is_inventory_reducing;
+
+            let use_post_only = self.config.post_only && !allow_taker_to_flatten;
+
+            if use_post_only {
                 builder = builder.post_only();
+            } else if is_inventory_reducing && self.config.post_only {
+                info!(
+                    side = ?target.side,
+                    pos = %position,
+                    price = %target.price,
+                    level = target.level,
+                    "inventory heavy, submitting non-post-only order to flatten"
+                );
             }
 
             match builder.submit().await {
@@ -832,7 +852,12 @@ impl Strategy {
 
                 if position.market_id == i32::from(self.config.market_id) {
                     if let Ok(p) = Decimal::from_str(&position.position) {
-                        self.state.position_base = p;
+                        let sign_multiplier = match position.sign {
+                            s if s < 0 => -Decimal::ONE,
+                            s if s > 0 => Decimal::ONE,
+                            _ => Decimal::ZERO,
+                        };
+                        self.state.position_base = p * sign_multiplier;
                     }
                 }
             }
@@ -962,9 +987,7 @@ impl Strategy {
             return Ok(());
         }
 
-        let three = Decimal::from_i64(3).unwrap();
-        let two = Decimal::from_i64(2).unwrap();
-        let threshold = hard * three / two;
+        let threshold = hard;
         if pos.abs() <= threshold {
             return Ok(());
         }
