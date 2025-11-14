@@ -1052,7 +1052,11 @@ impl Strategy {
         let level_spacing =
             (mid_price * level_spacing_fraction).round_dp(self.metadata.price_decimals);
 
-        let inventory_offset = if gamma > f64::EPSILON {
+        let inventory_pressure = self.inventory_pressure();
+        let bid_scale = self.inventory_scale(OrderSide::Bid, inventory_pressure);
+        let ask_scale = self.inventory_scale(OrderSide::Ask, inventory_pressure);
+
+        let mut inventory_offset = if gamma > f64::EPSILON {
             let q = (self.state.inventory - self.config.inventory_target)
                 .to_f64()
                 .unwrap_or(0.0);
@@ -1060,6 +1064,15 @@ impl Strategy {
         } else {
             Decimal::ZERO
         };
+
+        if inventory_offset != Decimal::ZERO {
+            let max_offset = (mid_price * Decimal::new(5, 1)).max(self.metadata.price_tick());
+            if max_offset > Decimal::ZERO {
+                let min = -max_offset;
+                let max = max_offset;
+                inventory_offset = decimal_clamp(inventory_offset, min, max);
+            }
+        }
 
         let mut reservation_price = (mid_price - inventory_offset).max(self.metadata.price_tick());
         if reservation_price <= Decimal::ZERO {
@@ -1074,6 +1087,9 @@ impl Strategy {
             half_spread = %base_half_spread,
             inventory = %self.state.inventory,
             inventory_target = %self.config.inventory_target,
+            inventory_pressure = %inventory_pressure,
+            bid_scale = %bid_scale,
+            ask_scale = %ask_scale,
             "computed avellaneda targets"
         );
 
@@ -1086,49 +1102,111 @@ impl Strategy {
                 });
             }
 
-            let quantity = (self.config.base_order_size * size_multiplier)
+            let base_quantity = (self.config.base_order_size * size_multiplier)
                 .round_dp(self.metadata.size_decimals);
 
-            if quantity <= Decimal::ZERO {
+            if base_quantity <= Decimal::ZERO {
                 continue;
             }
 
             let level_half_spread =
                 (base_half_spread + level_spacing * level_decimal).max(self.metadata.price_tick());
 
+            let mut bid_quantity =
+                (base_quantity * bid_scale).round_dp(self.metadata.size_decimals);
+            if bid_quantity > Decimal::ZERO && bid_quantity < self.metadata.min_base {
+                bid_quantity = self.metadata.min_base;
+            }
+
+            let mut ask_quantity =
+                (base_quantity * ask_scale).round_dp(self.metadata.size_decimals);
+            if ask_quantity > Decimal::ZERO && ask_quantity < self.metadata.min_base {
+                ask_quantity = self.metadata.min_base;
+            }
+
             let bid_price = (reservation_price - level_half_spread)
                 .max(self.metadata.price_tick())
                 .round_dp(self.metadata.price_decimals);
-            if bid_price > Decimal::ZERO {
+            if bid_price > Decimal::ZERO && bid_quantity > Decimal::ZERO {
                 let price_ticks = decimal_to_scaled_i64(bid_price, self.metadata.price_decimals)?;
-                let qty_ticks = decimal_to_scaled_i64(quantity, self.metadata.size_decimals)?;
+                let qty_ticks = decimal_to_scaled_i64(bid_quantity, self.metadata.size_decimals)?;
                 targets.push(OrderTarget {
                     side: OrderSide::Bid,
                     level,
                     price: bid_price,
                     price_ticks,
-                    quantity,
+                    quantity: bid_quantity,
                     qty_ticks,
                 });
             }
 
             let ask_price =
                 (reservation_price + level_half_spread).round_dp(self.metadata.price_decimals);
-            if ask_price > Decimal::ZERO {
+            if ask_price > Decimal::ZERO && ask_quantity > Decimal::ZERO {
                 let price_ticks = decimal_to_scaled_i64(ask_price, self.metadata.price_decimals)?;
-                let qty_ticks = decimal_to_scaled_i64(quantity, self.metadata.size_decimals)?;
+                let qty_ticks = decimal_to_scaled_i64(ask_quantity, self.metadata.size_decimals)?;
                 targets.push(OrderTarget {
                     side: OrderSide::Ask,
                     level,
                     price: ask_price,
                     price_ticks,
-                    quantity,
+                    quantity: ask_quantity,
                     qty_ticks,
                 });
             }
         }
 
         Ok(targets)
+    }
+
+    fn inventory_reference(&self) -> Option<Decimal> {
+        if let Some(max_inventory) = self.config.max_inventory {
+            if max_inventory > Decimal::ZERO {
+                return Some(max_inventory);
+            }
+        }
+
+        let mut reference = self.config.base_order_size;
+        if reference <= Decimal::ZERO {
+            return None;
+        }
+
+        let levels = Decimal::from_i64(self.config.levels as i64).unwrap_or(Decimal::ONE);
+        if levels > Decimal::ONE {
+            reference *= levels;
+        }
+
+        if reference > Decimal::ZERO {
+            Some(reference)
+        } else {
+            None
+        }
+    }
+
+    fn inventory_pressure(&self) -> Decimal {
+        let Some(reference) = self.inventory_reference() else {
+            return Decimal::ZERO;
+        };
+
+        if reference <= Decimal::ZERO {
+            return Decimal::ZERO;
+        }
+
+        let diff = self.state.inventory - self.config.inventory_target;
+        let ratio = diff / reference;
+        let min = Decimal::from_i32(-1).unwrap();
+        decimal_clamp(ratio, min, Decimal::ONE)
+    }
+
+    fn inventory_scale(&self, side: OrderSide, pressure: Decimal) -> Decimal {
+        let min_scale = Decimal::new(1, 2); // 0.01
+        let max_scale = Decimal::from_i32(3).unwrap();
+        let base = match side {
+            OrderSide::Bid => Decimal::ONE - pressure,
+            OrderSide::Ask => Decimal::ONE + pressure,
+        };
+
+        decimal_clamp(base, min_scale, max_scale)
     }
 
     fn price_tolerance_ticks(&self, mid_price: Decimal) -> Result<i64> {
@@ -1364,6 +1442,16 @@ fn decimal_to_scaled_i64(value: Decimal, decimals: u32) -> Result<i64> {
     scaled
         .to_i64()
         .ok_or_else(|| anyhow!("value {value} exceeds i64 range when scaled"))
+}
+
+fn decimal_clamp(value: Decimal, min: Decimal, max: Decimal) -> Decimal {
+    if value < min {
+        min
+    } else if value > max {
+        max
+    } else {
+        value
+    }
 }
 
 fn epoch_to_system_time(value: i64) -> SystemTime {
