@@ -330,6 +330,7 @@ struct StrategyState {
     last_best_bid: Option<Decimal>,
     last_best_ask: Option<Decimal>,
     last_rebalance_action: Option<Instant>,
+    force_requote: bool,
 }
 
 impl StrategyState {
@@ -358,7 +359,21 @@ impl StrategyState {
             last_best_bid: None,
             last_best_ask: None,
             last_rebalance_action: None,
+            force_requote: false,
         }
+    }
+
+    fn mark_force_requote(&mut self, reason: &str) {
+        if !self.force_requote {
+            debug!(reason, "forcing requote on next opportunity");
+        }
+        self.force_requote = true;
+    }
+
+    fn take_force_requote(&mut self) -> bool {
+        let forced = self.force_requote;
+        self.force_requote = false;
+        forced
     }
 
     fn next_client_order_id(&mut self) -> i64 {
@@ -514,7 +529,7 @@ impl Strategy {
             rate_limiter,
         };
 
-        strategy.sync_active_orders().await?;
+        strategy.sync_active_orders(true).await?;
         strategy.log_order_snapshot();
 
         Ok(strategy)
@@ -579,7 +594,7 @@ impl Strategy {
                     }
                 }
                 _ = active_sync_interval.tick() => {
-                    if let Err(err) = self.sync_active_orders().await {
+                    if let Err(err) = self.sync_active_orders(true).await {
                         warn!(?err, "failed to sync active orders");
                     }
                 }
@@ -590,7 +605,7 @@ impl Strategy {
                 warn!(?delay, "attempting to reconnect websocket after delay");
                 time::sleep(delay).await;
                 ws = self.connect_order_book_stream().await?;
-                if let Err(err) = self.sync_active_orders().await {
+                if let Err(err) = self.sync_active_orders(true).await {
                     warn!(?err, "failed to sync active orders after reconnect");
                 }
                 continue;
@@ -685,26 +700,30 @@ impl Strategy {
             return Ok(());
         }
 
+        let force_requote = self.state.take_force_requote();
+
         self.maybe_rebalance_inventory().await?;
 
-        if let Some(last_quote_price) = self.state.last_quote_mid_price {
-            let trigger_fraction = if self.config.quote_trigger_bps > Decimal::ZERO {
-                self.config.quote_trigger_bps / Decimal::from_i64(10_000).unwrap()
-            } else {
-                Decimal::ZERO
-            };
+        if !force_requote {
+            if let Some(last_quote_price) = self.state.last_quote_mid_price {
+                let trigger_fraction = if self.config.quote_trigger_bps > Decimal::ZERO {
+                    self.config.quote_trigger_bps / Decimal::from_i64(10_000).unwrap()
+                } else {
+                    Decimal::ZERO
+                };
 
-            if trigger_fraction > Decimal::ZERO && last_quote_price > Decimal::ZERO {
-                let move_fraction = ((mid_price - last_quote_price).abs()) / last_quote_price;
-                if move_fraction < trigger_fraction {
-                    debug!(
-                        %mid_price,
-                        %last_quote_price,
-                        %move_fraction,
-                        %trigger_fraction,
-                        "price move below quote trigger, skipping requote"
-                    );
-                    return Ok(());
+                if trigger_fraction > Decimal::ZERO && last_quote_price > Decimal::ZERO {
+                    let move_fraction = ((mid_price - last_quote_price).abs()) / last_quote_price;
+                    if move_fraction < trigger_fraction {
+                        debug!(
+                            %mid_price,
+                            %last_quote_price,
+                            %move_fraction,
+                            %trigger_fraction,
+                            "price move below quote trigger, skipping requote"
+                        );
+                        return Ok(());
+                    }
                 }
             }
         }
@@ -772,7 +791,7 @@ impl Strategy {
         }
 
         if mutated {
-            if let Err(err) = self.sync_active_orders().await {
+            if let Err(err) = self.sync_active_orders(false).await {
                 warn!(?err, "failed to sync active orders after requote");
             }
         }
@@ -931,7 +950,7 @@ impl Strategy {
         Ok(())
     }
 
-    async fn sync_active_orders(&mut self) -> Result<()> {
+    async fn sync_active_orders(&mut self, watch_for_fills: bool) -> Result<()> {
         let response = self
             .api_call("active orders", RateLimitPriority::Routine, || async {
                 self.client
@@ -961,6 +980,7 @@ impl Strategy {
             updated.insert(active.order_index, active);
         }
 
+        let mut removed = false;
         for order_index in self
             .state
             .active_orders
@@ -973,6 +993,7 @@ impl Strategy {
                 order_index,
                 "order left active set (likely filled or cancelled externally)"
             );
+            removed = true;
         }
 
         self.state.active_orders = updated;
@@ -988,6 +1009,11 @@ impl Strategy {
             if self.state.by_client.contains_key(&client_id) {
                 self.state.pending_orders.remove(&client_id);
             }
+        }
+
+        if watch_for_fills && removed {
+            self.state
+                .mark_force_requote("active order set changed after fill");
         }
 
         Ok(())
@@ -1049,6 +1075,9 @@ impl Strategy {
                 self.client.account().details().await
             })
             .await?;
+        let size_tick = Decimal::new(1, self.metadata.size_decimals);
+        let mut position_changed = false;
+
         for account in &details.accounts {
             info!(
                 account_index = account.account_index,
@@ -1083,13 +1112,22 @@ impl Strategy {
                             s if s > 0 => Decimal::ONE,
                             _ => Decimal::ZERO,
                         };
-                        self.state.position_base = p * sign_multiplier;
+                        let new_position = p * sign_multiplier;
+                        if (new_position - self.state.position_base).abs() >= size_tick {
+                            position_changed = true;
+                        }
+                        self.state.position_base = new_position;
                     }
                 }
             }
         }
 
         self.log_order_snapshot();
+
+        if position_changed {
+            self.state
+                .mark_force_requote("inventory changed after fills");
+        }
         Ok(())
     }
 
