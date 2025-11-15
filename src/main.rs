@@ -1,21 +1,27 @@
 use std::{
-    collections::{HashMap, HashSet},
+    cmp,
+    collections::{HashMap, HashSet, VecDeque},
     env,
+    future::Future,
+    num::NonZeroI64,
     path::PathBuf,
     str::FromStr,
+    sync::Arc,
     time::{Duration as StdDuration, SystemTime, UNIX_EPOCH},
 };
 
 use anyhow::{Context, Result, anyhow};
 use futures_util::StreamExt;
 use lighter_client::{
-    lighter_client::{LighterClient, OrderSide},
+    LighterError,
+    lighter_client::{LighterClient, OrderSide, Result as LighterResult},
     models,
     types::{AccountId, ApiKeyIndex, BaseQty, Expiry, MarketId, Price},
-    ws_client::{OrderBookEvent, WsEvent},
+    ws_client::{OrderBookEvent, WsEvent, WsStream},
 };
 use rust_decimal::Decimal;
 use rust_decimal::prelude::{FromPrimitive, One, ToPrimitive};
+use tokio::sync::Mutex;
 use tokio::time::{self, Instant};
 use tracing::{debug, error, info, warn};
 use tracing_subscriber::EnvFilter;
@@ -71,6 +77,10 @@ struct Config {
     inventory_hard_limit: Decimal,
     inventory_skew_bps: Decimal,
     inventory_size_skew: Decimal,
+    api_rate_limit: u32,
+    api_rate_period: StdDuration,
+    max_retries: u32,
+    retry_base_delay: StdDuration,
 }
 
 impl Config {
@@ -137,6 +147,24 @@ impl Config {
         let inventory_hard_limit = decimal_env("LIGHTER_MM_INV_HARD_LIMIT", Decimal::new(20, 3))?;
         let inventory_skew_bps = decimal_env("LIGHTER_MM_INV_SKEW_BPS", Decimal::from(40))?;
         let inventory_size_skew = decimal_env("LIGHTER_MM_INV_SIZE_SKEW", Decimal::new(5, 1))?;
+        let api_rate_limit = env::var("LIGHTER_MM_API_RATE_LIMIT")
+            .ok()
+            .and_then(|value| value.parse::<u32>().ok())
+            .unwrap_or(5);
+        let api_rate_period = env::var("LIGHTER_MM_API_RATE_PERIOD_MS")
+            .ok()
+            .and_then(|value| value.parse::<u64>().ok())
+            .map(|value| StdDuration::from_millis(value.max(1)))
+            .unwrap_or_else(|| StdDuration::from_millis(1_000));
+        let max_retries = env::var("LIGHTER_MM_MAX_RETRIES")
+            .ok()
+            .and_then(|value| value.parse::<u32>().ok())
+            .unwrap_or(3);
+        let retry_base_delay = env::var("LIGHTER_MM_RETRY_BASE_DELAY_MS")
+            .ok()
+            .and_then(|value| value.parse::<u64>().ok())
+            .map(|value| StdDuration::from_millis(value.max(1)))
+            .unwrap_or_else(|| StdDuration::from_millis(500));
 
         Ok(Self {
             api_url,
@@ -162,6 +190,10 @@ impl Config {
             inventory_hard_limit,
             inventory_skew_bps,
             inventory_size_skew,
+            api_rate_limit,
+            api_rate_period,
+            max_retries,
+            retry_base_delay,
         })
     }
 }
@@ -279,6 +311,7 @@ struct Strategy {
     metadata: MarketMetadata,
     client: LighterClient,
     state: StrategyState,
+    rate_limiter: RateLimiter,
 }
 
 struct StrategyState {
@@ -370,6 +403,63 @@ impl StrategyState {
     }
 }
 
+#[derive(Clone)]
+struct RateLimiter {
+    capacity: usize,
+    period: StdDuration,
+    calls: Arc<Mutex<VecDeque<Instant>>>,
+}
+
+impl RateLimiter {
+    fn new(capacity: u32, period: StdDuration) -> Self {
+        Self {
+            capacity: capacity as usize,
+            period,
+            calls: Arc::new(Mutex::new(VecDeque::new())),
+        }
+    }
+
+    async fn acquire(&self) {
+        if self.capacity == 0 || self.period.is_zero() {
+            return;
+        }
+
+        loop {
+            let mut calls = self.calls.lock().await;
+            let now = Instant::now();
+
+            while let Some(&oldest) = calls.front() {
+                if now.saturating_duration_since(oldest) >= self.period {
+                    calls.pop_front();
+                } else {
+                    break;
+                }
+            }
+
+            if calls.len() < self.capacity {
+                calls.push_back(now);
+                return;
+            }
+
+            let wait = calls
+                .front()
+                .map(|&oldest| {
+                    let elapsed = now.saturating_duration_since(oldest);
+                    self.period.saturating_sub(elapsed)
+                })
+                .unwrap_or(self.period);
+
+            drop(calls);
+
+            if wait.is_zero() {
+                continue;
+            }
+
+            time::sleep(wait).await;
+        }
+    }
+}
+
 impl Strategy {
     async fn new(config: Config) -> Result<Self> {
         let mut builder = LighterClient::builder()
@@ -384,7 +474,10 @@ impl Strategy {
 
         let client = builder.build().await?;
 
-        let metadata = Self::load_market_metadata(&client, config.market_id).await?;
+        let rate_limiter = RateLimiter::new(config.api_rate_limit, config.api_rate_period);
+
+        let metadata =
+            Self::load_market_metadata(&client, config.market_id, &rate_limiter, &config).await?;
         info!(
             "loaded market metadata for {} (id {}): min_base={} ({} ticks) min_quote={}",
             metadata.symbol,
@@ -399,6 +492,7 @@ impl Strategy {
             state: StrategyState::new(config.min_quote_interval),
             config,
             client,
+            rate_limiter,
         };
 
         strategy.sync_active_orders().await?;
@@ -407,20 +501,25 @@ impl Strategy {
         Ok(strategy)
     }
 
-    async fn run(&mut self) -> Result<()> {
-        let mut ws = self
-            .client
-            .ws()
-            .subscribe_order_book(self.config.market_id)
-            .connect()
-            .await?;
+    async fn api_call<F, Fut, T>(&self, label: &str, action: F) -> Result<T>
+    where
+        F: FnMut() -> Fut,
+        Fut: Future<Output = LighterResult<T>>,
+    {
+        call_api_with_retry(&self.config, &self.rate_limiter, label, action)
+            .await
+            .map_err(|err| anyhow!(err))
+    }
 
+    async fn run(&mut self) -> Result<()> {
+        let mut ws = self.connect_order_book_stream().await?;
         let mut account_log_interval = time::interval(self.config.account_snapshot_interval);
         let mut active_sync_interval = time::interval(self.config.active_order_sync_interval);
 
         info!("strategy event loop started");
 
         loop {
+            let mut reconnect = false;
             tokio::select! {
                 maybe_event = ws.next() => {
                     match maybe_event {
@@ -430,20 +529,23 @@ impl Strategy {
                         Some(Ok(WsEvent::Connected)) => {
                             info!("websocket connected to market {}", self.config.market_id);
                         }
+                        Some(Ok(WsEvent::Pong)) => {
+                            debug!("received websocket pong");
+                        }
                         Some(Ok(WsEvent::Closed(frame))) => {
                             warn!(?frame, "websocket stream closed");
-                            break;
+                            reconnect = true;
                         }
                         Some(Ok(other)) => {
                             debug!(?other, "ignored websocket event");
                         }
                         Some(Err(err)) => {
                             error!(?err, "websocket stream error");
-                            return Err(err.into());
+                            reconnect = true;
                         }
                         None => {
                             warn!("websocket stream ended");
-                            break;
+                            reconnect = true;
                         }
                     }
                 }
@@ -454,16 +556,61 @@ impl Strategy {
                     self.sync_active_orders().await?;
                 }
             }
-        }
 
-        Ok(())
+            if reconnect {
+                let delay = StdDuration::from_secs(1);
+                warn!(?delay, "attempting to reconnect websocket after delay");
+                time::sleep(delay).await;
+                ws = self.connect_order_book_stream().await?;
+                self.sync_active_orders().await?;
+                continue;
+            }
+        }
+    }
+
+    async fn connect_order_book_stream(&self) -> Result<WsStream> {
+        let mut attempt: u32 = 0;
+        loop {
+            match self
+                .client
+                .ws()
+                .subscribe_order_book(self.config.market_id)
+                .connect()
+                .await
+            {
+                Ok(stream) => {
+                    if attempt > 0 {
+                        info!(attempt, "websocket reconnected after retries");
+                    }
+                    return Ok(stream);
+                }
+                Err(err) => {
+                    let backoff_secs = 1_u64 << cmp::min(attempt, 5);
+                    let delay = StdDuration::from_secs(backoff_secs);
+                    warn!(
+                        attempt,
+                        ?err,
+                        ?delay,
+                        "failed to connect websocket, retrying"
+                    );
+                    attempt = attempt.saturating_add(1);
+                    time::sleep(delay).await;
+                }
+            }
+        }
     }
 
     async fn load_market_metadata(
         client: &LighterClient,
         market: MarketId,
+        limiter: &RateLimiter,
+        config: &Config,
     ) -> Result<MarketMetadata> {
-        let details = client.orders().book_details(Some(market)).await?;
+        let details = call_api_with_retry(config, limiter, "order book details", || async {
+            client.orders().book_details(Some(market)).await
+        })
+        .await
+        .map_err(|err| anyhow!(err))?;
         let detail = details
             .order_book_details
             .iter()
@@ -590,9 +737,12 @@ impl Strategy {
             }
 
             match self
-                .client
-                .cancel(self.config.market_id, *order_index)
-                .submit()
+                .api_call("cancel order", || async {
+                    self.client
+                        .cancel(self.config.market_id, *order_index)
+                        .submit()
+                        .await
+                })
                 .await
             {
                 Ok(submission) => {
@@ -631,28 +781,58 @@ impl Strategy {
                 continue;
             }
 
-            let qty = BaseQty::try_from(target.qty_ticks)
-                .map_err(|_| anyhow!("quantity must be positive"))?;
-            let expiry = Expiry::from_now(::time::Duration::seconds(self.config.order_expiry_secs));
-            let price = Price::ticks(target.price_ticks);
+            let qty_non_zero = NonZeroI64::new(target.qty_ticks)
+                .ok_or_else(|| anyhow!("quantity must be positive"))?;
             let client_order_index = self.state.next_client_order_id();
 
-            let builder = match target.side {
-                OrderSide::Bid => self.client.order(self.config.market_id).buy(),
-                OrderSide::Ask => self.client.order(self.config.market_id).sell(),
+            let position = self.state.position_base;
+            let is_inventory_reducing = match target.side {
+                OrderSide::Bid => position < Decimal::ZERO,
+                OrderSide::Ask => position > Decimal::ZERO,
             };
 
-            let mut builder = builder
-                .with_client_order_id(client_order_index)
-                .qty(qty)
-                .limit(price)
-                .expires_at(expiry);
+            let hard = self.config.inventory_hard_limit;
+            let allow_taker_to_flatten =
+                hard > Decimal::ZERO && position.abs() >= hard && is_inventory_reducing;
 
-            if self.config.post_only {
-                builder = builder.post_only();
+            let use_post_only = self.config.post_only && !allow_taker_to_flatten;
+
+            if !use_post_only && is_inventory_reducing && self.config.post_only {
+                info!(
+                    side = ?target.side,
+                    pos = %position,
+                    price = %target.price,
+                    level = target.level,
+                    "inventory heavy, submitting non-post-only order to flatten"
+                );
             }
 
-            match builder.submit().await {
+            let market_id = self.config.market_id;
+            let price_ticks = target.price_ticks;
+            let expiry_secs = self.config.order_expiry_secs;
+            let side = target.side;
+            let level = target.level;
+            let post_only = use_post_only;
+
+            match self
+                .api_call("submit order", || async {
+                    let mut builder = match side {
+                        OrderSide::Bid => self.client.order(market_id).buy(),
+                        OrderSide::Ask => self.client.order(market_id).sell(),
+                    }
+                    .with_client_order_id(client_order_index)
+                    .qty(BaseQty::new(qty_non_zero))
+                    .limit(Price::ticks(price_ticks))
+                    .expires_at(Expiry::from_now(::time::Duration::seconds(expiry_secs)));
+
+                    if post_only {
+                        builder = builder.post_only();
+                    }
+
+                    builder.submit().await
+                })
+                .await
+            {
                 Ok(submission) => {
                     info!(
                         side = ?target.side,
@@ -679,7 +859,7 @@ impl Strategy {
                 Err(err) => {
                     warn!(
                         side = ?target.side,
-                        level = target.level,
+                        level,
                         price = %target.price,
                         qty = %target.quantity,
                         ?err,
@@ -694,9 +874,12 @@ impl Strategy {
 
     async fn sync_active_orders(&mut self) -> Result<()> {
         let response = self
-            .client
-            .account()
-            .active_orders(self.config.market_id)
+            .api_call("active orders", || async {
+                self.client
+                    .account()
+                    .active_orders(self.config.market_id)
+                    .await
+            })
             .await?;
 
         let mut updated = HashMap::new();
@@ -802,7 +985,11 @@ impl Strategy {
     }
 
     async fn log_account_snapshot(&mut self) -> Result<()> {
-        let details = self.client.account().details().await?;
+        let details = self
+            .api_call("account details", || async {
+                self.client.account().details().await
+            })
+            .await?;
         for account in &details.accounts {
             info!(
                 account_index = account.account_index,
@@ -832,7 +1019,12 @@ impl Strategy {
 
                 if position.market_id == i32::from(self.config.market_id) {
                     if let Ok(p) = Decimal::from_str(&position.position) {
-                        self.state.position_base = p;
+                        let sign_multiplier = match position.sign {
+                            s if s < 0 => -Decimal::ONE,
+                            s if s > 0 => Decimal::ONE,
+                            _ => Decimal::ZERO,
+                        };
+                        self.state.position_base = p * sign_multiplier;
                     }
                 }
             }
@@ -962,9 +1154,7 @@ impl Strategy {
             return Ok(());
         }
 
-        let three = Decimal::from_i64(3).unwrap();
-        let two = Decimal::from_i64(2).unwrap();
-        let threshold = hard * three / two;
+        let threshold = hard;
         if pos.abs() <= threshold {
             return Ok(());
         }
@@ -994,22 +1184,27 @@ impl Strategy {
         };
         let price_ticks = decimal_to_scaled_i64(price, self.metadata.price_decimals)?;
 
-        let qty_base = BaseQty::try_from(qty_ticks)
-            .map_err(|_| anyhow!("rebalance quantity must be positive"))?;
-        let expiry = Expiry::from_now(::time::Duration::seconds(self.config.order_expiry_secs));
+        let qty_non_zero = NonZeroI64::new(qty_ticks)
+            .ok_or_else(|| anyhow!("rebalance quantity must be positive"))?;
         let client_order_index = self.state.next_client_order_id();
 
-        let builder = match side {
-            OrderSide::Bid => self.client.order(self.config.market_id).buy(),
-            OrderSide::Ask => self.client.order(self.config.market_id).sell(),
-        };
+        let market_id = self.config.market_id;
+        let expiry_secs = self.config.order_expiry_secs;
+        let side_for_submit = side;
 
-        match builder
-            .with_client_order_id(client_order_index)
-            .qty(qty_base)
-            .limit(Price::ticks(price_ticks))
-            .expires_at(expiry)
-            .submit()
+        match self
+            .api_call("inventory rebalance", || async {
+                let builder = match side_for_submit {
+                    OrderSide::Bid => self.client.order(market_id).buy(),
+                    OrderSide::Ask => self.client.order(market_id).sell(),
+                }
+                .with_client_order_id(client_order_index)
+                .qty(BaseQty::new(qty_non_zero))
+                .limit(Price::ticks(price_ticks))
+                .expires_at(Expiry::from_now(::time::Duration::seconds(expiry_secs)));
+
+                builder.submit().await
+            })
             .await
         {
             Ok(submission) => {
@@ -1079,6 +1274,78 @@ impl Strategy {
             expires_at,
         })
     }
+}
+
+async fn call_api_with_retry<F, Fut, T>(
+    config: &Config,
+    limiter: &RateLimiter,
+    label: &str,
+    action: F,
+) -> Result<T, LighterError>
+where
+    F: FnMut() -> Fut,
+    Fut: Future<Output = LighterResult<T>>,
+{
+    let mut action = action;
+    let mut attempt: u32 = 0;
+
+    loop {
+        limiter.acquire().await;
+
+        match action().await {
+            Ok(value) => return Ok(value),
+            Err(err) => {
+                if let Some(delay) = compute_retry_delay(config, &err, attempt) {
+                    warn!(
+                        attempt,
+                        ?delay,
+                        error = %err,
+                        label = label,
+                        "api request failed, retrying"
+                    );
+                    time::sleep(delay).await;
+                    attempt = attempt.saturating_add(1);
+                    continue;
+                }
+
+                return Err(err);
+            }
+        }
+    }
+}
+
+fn compute_retry_delay(config: &Config, err: &LighterError, attempt: u32) -> Option<StdDuration> {
+    if attempt >= config.max_retries {
+        return None;
+    }
+
+    match err {
+        LighterError::RateLimited { retry_after } => Some(match retry_after {
+            Some(secs) => StdDuration::from_secs((*secs).max(1)),
+            None => exponential_backoff(config.retry_base_delay, attempt),
+        }),
+        LighterError::Http { status, .. } if *status == 429 => {
+            Some(exponential_backoff(config.retry_base_delay, attempt))
+        }
+        LighterError::Server { status, .. } if *status == 429 => {
+            Some(exponential_backoff(config.retry_base_delay, attempt))
+        }
+        _ => None,
+    }
+}
+
+fn exponential_backoff(base: StdDuration, attempt: u32) -> StdDuration {
+    let base = if base.is_zero() {
+        StdDuration::from_millis(1)
+    } else {
+        base
+    };
+
+    let shift = attempt.min(6);
+    let multiplier = 1_u32 << shift;
+
+    base.checked_mul(multiplier)
+        .unwrap_or_else(|| StdDuration::from_secs(60))
 }
 
 fn required_env(name: &str) -> Result<String> {
