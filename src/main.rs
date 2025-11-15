@@ -66,6 +66,7 @@ struct Config {
     level_size_multiplier: Decimal,
     levels: usize,
     price_tolerance_bps: Decimal,
+    quote_trigger_bps: Decimal,
     qty_tolerance_ticks: i64,
     order_expiry_secs: i64,
     stale_order_after: StdDuration,
@@ -110,6 +111,7 @@ impl Config {
             .filter(|value| *value > 0)
             .unwrap_or(2);
         let price_tolerance_bps = decimal_env("LIGHTER_MM_TOLERANCE_BPS", Decimal::from(2))?;
+        let quote_trigger_bps = decimal_env("LIGHTER_MM_QUOTE_TRIGGER_BPS", Decimal::from(5))?;
         let qty_tolerance_ticks = env::var("LIGHTER_MM_QTY_TOLERANCE_TICKS")
             .ok()
             .and_then(|value| value.parse::<i64>().ok())
@@ -179,6 +181,7 @@ impl Config {
             level_size_multiplier,
             levels,
             price_tolerance_bps,
+            quote_trigger_bps,
             qty_tolerance_ticks,
             order_expiry_secs,
             stale_order_after,
@@ -321,11 +324,13 @@ struct StrategyState {
     matched_orders: HashSet<i64>,
     last_mid_price: Option<Decimal>,
     last_quote_action: Instant,
+    last_quote_mid_price: Option<Decimal>,
     next_client_order_id: i64,
     position_base: Decimal,
     last_best_bid: Option<Decimal>,
     last_best_ask: Option<Decimal>,
     last_rebalance_action: Option<Instant>,
+    force_requote: bool,
 }
 
 impl StrategyState {
@@ -348,12 +353,27 @@ impl StrategyState {
             matched_orders: HashSet::new(),
             last_mid_price: None,
             last_quote_action: Instant::now() - min_quote_interval,
+            last_quote_mid_price: None,
             next_client_order_id: initial,
             position_base: Decimal::ZERO,
             last_best_bid: None,
             last_best_ask: None,
             last_rebalance_action: None,
+            force_requote: false,
         }
+    }
+
+    fn mark_force_requote(&mut self, reason: &str) {
+        if !self.force_requote {
+            debug!(reason, "forcing requote on next opportunity");
+        }
+        self.force_requote = true;
+    }
+
+    fn take_force_requote(&mut self) -> bool {
+        let forced = self.force_requote;
+        self.force_requote = false;
+        forced
     }
 
     fn next_client_order_id(&mut self) -> i64 {
@@ -403,60 +423,74 @@ impl StrategyState {
     }
 }
 
+#[derive(Clone, Copy, Debug)]
+enum RateLimitPriority {
+    Critical,
+    Routine,
+}
+
 #[derive(Clone)]
 struct RateLimiter {
     capacity: usize,
+    safe_capacity: usize,
     period: StdDuration,
     calls: Arc<Mutex<VecDeque<Instant>>>,
 }
 
 impl RateLimiter {
     fn new(capacity: u32, period: StdDuration) -> Self {
+        let capacity = capacity as usize;
+        let safe_capacity = if capacity == 0 {
+            0
+        } else {
+            let safe = ((capacity as f64) * 0.8).floor() as usize;
+            cmp::max(1, safe).min(capacity)
+        };
+
         Self {
-            capacity: capacity as usize,
+            capacity,
+            safe_capacity,
             period,
             calls: Arc::new(Mutex::new(VecDeque::new())),
         }
     }
 
-    async fn acquire(&self) {
+    async fn try_acquire(&self, priority: RateLimitPriority) -> bool {
         if self.capacity == 0 || self.period.is_zero() {
-            return;
+            return true;
         }
 
-        loop {
-            let mut calls = self.calls.lock().await;
-            let now = Instant::now();
+        let limit = match priority {
+            RateLimitPriority::Critical => self.capacity,
+            RateLimitPriority::Routine => self.safe_capacity,
+        };
 
-            while let Some(&oldest) = calls.front() {
-                if now.saturating_duration_since(oldest) >= self.period {
-                    calls.pop_front();
-                } else {
-                    break;
-                }
-            }
-
-            if calls.len() < self.capacity {
-                calls.push_back(now);
-                return;
-            }
-
-            let wait = calls
-                .front()
-                .map(|&oldest| {
-                    let elapsed = now.saturating_duration_since(oldest);
-                    self.period.saturating_sub(elapsed)
-                })
-                .unwrap_or(self.period);
-
-            drop(calls);
-
-            if wait.is_zero() {
-                continue;
-            }
-
-            time::sleep(wait).await;
+        if limit == 0 {
+            return true;
         }
+
+        let mut calls = self.calls.lock().await;
+        let now = Instant::now();
+
+        while let Some(&oldest) = calls.front() {
+            if now.saturating_duration_since(oldest) >= self.period {
+                calls.pop_front();
+            } else {
+                break;
+            }
+        }
+
+        if calls.len() < limit {
+            calls.push_back(now);
+            true
+        } else {
+            false
+        }
+    }
+
+    fn retry_after_secs(&self) -> u64 {
+        let secs = self.period.as_secs();
+        if secs == 0 { 1 } else { secs }
     }
 }
 
@@ -495,18 +529,23 @@ impl Strategy {
             rate_limiter,
         };
 
-        strategy.sync_active_orders().await?;
+        strategy.sync_active_orders(true).await?;
         strategy.log_order_snapshot();
 
         Ok(strategy)
     }
 
-    async fn api_call<F, Fut, T>(&self, label: &str, action: F) -> Result<T>
+    async fn api_call<F, Fut, T>(
+        &self,
+        label: &str,
+        priority: RateLimitPriority,
+        action: F,
+    ) -> Result<T>
     where
         F: FnMut() -> Fut,
         Fut: Future<Output = LighterResult<T>>,
     {
-        call_api_with_retry(&self.config, &self.rate_limiter, label, action)
+        call_api_with_retry(&self.config, &self.rate_limiter, priority, label, action)
             .await
             .map_err(|err| anyhow!(err))
     }
@@ -550,10 +589,14 @@ impl Strategy {
                     }
                 }
                 _ = account_log_interval.tick() => {
-                    self.log_account_snapshot().await?;
+                    if let Err(err) = self.log_account_snapshot().await {
+                        warn!(?err, "failed to log account snapshot");
+                    }
                 }
                 _ = active_sync_interval.tick() => {
-                    self.sync_active_orders().await?;
+                    if let Err(err) = self.sync_active_orders(true).await {
+                        warn!(?err, "failed to sync active orders");
+                    }
                 }
             }
 
@@ -562,7 +605,9 @@ impl Strategy {
                 warn!(?delay, "attempting to reconnect websocket after delay");
                 time::sleep(delay).await;
                 ws = self.connect_order_book_stream().await?;
-                self.sync_active_orders().await?;
+                if let Err(err) = self.sync_active_orders(true).await {
+                    warn!(?err, "failed to sync active orders after reconnect");
+                }
                 continue;
             }
         }
@@ -606,9 +651,13 @@ impl Strategy {
         limiter: &RateLimiter,
         config: &Config,
     ) -> Result<MarketMetadata> {
-        let details = call_api_with_retry(config, limiter, "order book details", || async {
-            client.orders().book_details(Some(market)).await
-        })
+        let details = call_api_with_retry(
+            config,
+            limiter,
+            RateLimitPriority::Routine,
+            "order book details",
+            || async { client.orders().book_details(Some(market)).await },
+        )
         .await
         .map_err(|err| anyhow!(err))?;
         let detail = details
@@ -651,7 +700,33 @@ impl Strategy {
             return Ok(());
         }
 
+        let force_requote = self.state.take_force_requote();
+
         self.maybe_rebalance_inventory().await?;
+
+        if !force_requote {
+            if let Some(last_quote_price) = self.state.last_quote_mid_price {
+                let trigger_fraction = if self.config.quote_trigger_bps > Decimal::ZERO {
+                    self.config.quote_trigger_bps / Decimal::from_i64(10_000).unwrap()
+                } else {
+                    Decimal::ZERO
+                };
+
+                if trigger_fraction > Decimal::ZERO && last_quote_price > Decimal::ZERO {
+                    let move_fraction = ((mid_price - last_quote_price).abs()) / last_quote_price;
+                    if move_fraction < trigger_fraction {
+                        debug!(
+                            %mid_price,
+                            %last_quote_price,
+                            %move_fraction,
+                            %trigger_fraction,
+                            "price move below quote trigger, skipping requote"
+                        );
+                        return Ok(());
+                    }
+                }
+            }
+        }
 
         let targets = self.build_targets(mid_price)?;
         if targets.is_empty() {
@@ -716,9 +791,12 @@ impl Strategy {
         }
 
         if mutated {
-            self.sync_active_orders().await?;
+            if let Err(err) = self.sync_active_orders(false).await {
+                warn!(?err, "failed to sync active orders after requote");
+            }
         }
 
+        self.state.last_quote_mid_price = Some(mid_price);
         self.state.last_quote_action = now;
         Ok(())
     }
@@ -737,7 +815,7 @@ impl Strategy {
             }
 
             match self
-                .api_call("cancel order", || async {
+                .api_call("cancel order", RateLimitPriority::Critical, || async {
                     self.client
                         .cancel(self.config.market_id, *order_index)
                         .submit()
@@ -815,7 +893,7 @@ impl Strategy {
             let post_only = use_post_only;
 
             match self
-                .api_call("submit order", || async {
+                .api_call("submit order", RateLimitPriority::Critical, || async {
                     let mut builder = match side {
                         OrderSide::Bid => self.client.order(market_id).buy(),
                         OrderSide::Ask => self.client.order(market_id).sell(),
@@ -872,9 +950,9 @@ impl Strategy {
         Ok(())
     }
 
-    async fn sync_active_orders(&mut self) -> Result<()> {
+    async fn sync_active_orders(&mut self, watch_for_fills: bool) -> Result<()> {
         let response = self
-            .api_call("active orders", || async {
+            .api_call("active orders", RateLimitPriority::Routine, || async {
                 self.client
                     .account()
                     .active_orders(self.config.market_id)
@@ -902,6 +980,7 @@ impl Strategy {
             updated.insert(active.order_index, active);
         }
 
+        let mut removed = false;
         for order_index in self
             .state
             .active_orders
@@ -914,6 +993,7 @@ impl Strategy {
                 order_index,
                 "order left active set (likely filled or cancelled externally)"
             );
+            removed = true;
         }
 
         self.state.active_orders = updated;
@@ -929,6 +1009,11 @@ impl Strategy {
             if self.state.by_client.contains_key(&client_id) {
                 self.state.pending_orders.remove(&client_id);
             }
+        }
+
+        if watch_for_fills && removed {
+            self.state
+                .mark_force_requote("active order set changed after fill");
         }
 
         Ok(())
@@ -986,10 +1071,13 @@ impl Strategy {
 
     async fn log_account_snapshot(&mut self) -> Result<()> {
         let details = self
-            .api_call("account details", || async {
+            .api_call("account details", RateLimitPriority::Routine, || async {
                 self.client.account().details().await
             })
             .await?;
+        let size_tick = Decimal::new(1, self.metadata.size_decimals);
+        let mut position_changed = false;
+
         for account in &details.accounts {
             info!(
                 account_index = account.account_index,
@@ -1024,13 +1112,22 @@ impl Strategy {
                             s if s > 0 => Decimal::ONE,
                             _ => Decimal::ZERO,
                         };
-                        self.state.position_base = p * sign_multiplier;
+                        let new_position = p * sign_multiplier;
+                        if (new_position - self.state.position_base).abs() >= size_tick {
+                            position_changed = true;
+                        }
+                        self.state.position_base = new_position;
                     }
                 }
             }
         }
 
         self.log_order_snapshot();
+
+        if position_changed {
+            self.state
+                .mark_force_requote("inventory changed after fills");
+        }
         Ok(())
     }
 
@@ -1193,18 +1290,22 @@ impl Strategy {
         let side_for_submit = side;
 
         match self
-            .api_call("inventory rebalance", || async {
-                let builder = match side_for_submit {
-                    OrderSide::Bid => self.client.order(market_id).buy(),
-                    OrderSide::Ask => self.client.order(market_id).sell(),
-                }
-                .with_client_order_id(client_order_index)
-                .qty(BaseQty::new(qty_non_zero))
-                .limit(Price::ticks(price_ticks))
-                .expires_at(Expiry::from_now(::time::Duration::seconds(expiry_secs)));
+            .api_call(
+                "inventory rebalance",
+                RateLimitPriority::Critical,
+                || async {
+                    let builder = match side_for_submit {
+                        OrderSide::Bid => self.client.order(market_id).buy(),
+                        OrderSide::Ask => self.client.order(market_id).sell(),
+                    }
+                    .with_client_order_id(client_order_index)
+                    .qty(BaseQty::new(qty_non_zero))
+                    .limit(Price::ticks(price_ticks))
+                    .expires_at(Expiry::from_now(::time::Duration::seconds(expiry_secs)));
 
-                builder.submit().await
-            })
+                    builder.submit().await
+                },
+            )
             .await
         {
             Ok(submission) => {
@@ -1279,6 +1380,7 @@ impl Strategy {
 async fn call_api_with_retry<F, Fut, T>(
     config: &Config,
     limiter: &RateLimiter,
+    priority: RateLimitPriority,
     label: &str,
     action: F,
 ) -> Result<T, LighterError>
@@ -1290,7 +1392,16 @@ where
     let mut attempt: u32 = 0;
 
     loop {
-        limiter.acquire().await;
+        if !limiter.try_acquire(priority).await {
+            warn!(
+                ?priority,
+                label = label,
+                "local rate limit budget exhausted, skipping request"
+            );
+            return Err(LighterError::RateLimited {
+                retry_after: Some(limiter.retry_after_secs()),
+            });
+        }
 
         match action().await {
             Ok(value) => return Ok(value),
